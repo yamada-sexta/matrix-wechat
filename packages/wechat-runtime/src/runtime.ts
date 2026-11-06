@@ -13,6 +13,11 @@ import {
 import { join } from "node:path";
 import type * as frida from "frida";
 import {
+  outboundProfileSchema,
+  sessionProfileSchema,
+  storageProfileSchema,
+} from "wechat-native/profiles";
+import {
   attachmentChecksum,
   receivedFile,
   receivedImage,
@@ -21,25 +26,27 @@ import {
   receivedVideo,
 } from "./attachments";
 import { voiceAudioProcess } from "./audio";
+import { DownloadRetry } from "./download-retry";
 import { loginQRImage } from "./login-qr";
 import { imageType, sharedCardAsset, stickerImage } from "./media";
-import {
-  outboundProfileSchema,
-  sessionProfileSchema,
-  storageProfileSchema,
-} from "./native/profiles";
 import { loginRequestSchema, textMessageSchema, validateParams } from "./schemas";
 import { databaseAccount, Storage } from "./storage";
-import { APIError, type Database, type Event, type Row, type Status } from "./types";
+import { APIError, type Database, type Event, type Message, type Row, type Status } from "./types";
 
 const outbound = outboundProfileSchema.parse(
-  Bun.TOML.parse(await Bun.file(new URL("./native/outbound_profile.toml", import.meta.url)).text()),
+  Bun.TOML.parse(
+    await Bun.file(new URL(import.meta.resolve("wechat-native/outbound_profile.toml"))).text(),
+  ),
 );
 const profile = storageProfileSchema.parse(
-  Bun.TOML.parse(await Bun.file(new URL("./native/storage_profile.toml", import.meta.url)).text()),
+  Bun.TOML.parse(
+    await Bun.file(new URL(import.meta.resolve("wechat-native/storage_profile.toml"))).text(),
+  ),
 );
 const sessionProfile = sessionProfileSchema.parse(
-  Bun.TOML.parse(await Bun.file(new URL("./native/session_profile.toml", import.meta.url)).text()),
+  Bun.TOML.parse(
+    await Bun.file(new URL(import.meta.resolve("wechat-native/session_profile.toml"))).text(),
+  ),
 );
 for (const metadata of [outbound, sessionProfile])
   if (metadata.elf_sha256 !== profile.artifact.sha256)
@@ -48,6 +55,8 @@ for (const metadata of [outbound, sessionProfile])
 const root = join(import.meta.dir, ".."),
   data = process.env.WECHAT_DATA_DIR || "/home/wechat/.cache/wechatlinux";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const adapterPath = join(root, "dist/native/download.so");
+const owlHash = "f5d7874c73cde5cb3044668dad9374221e9fda30e7573eda143930fb4cf5560f";
 async function sha(path: string) {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk);
@@ -95,6 +104,9 @@ export class Runtime {
   private serial: Promise<any> = Promise.resolve();
   private subscribers = new Set<(e: Event) => void>();
   private sendReady = false;
+  private downloadAccount = "";
+  private downloadArtifact = "";
+  private downloadRetries = new DownloadRetry();
   verified = new Set<string>();
   private uploads = new Map<
     string,
@@ -439,6 +451,28 @@ export class Runtime {
     const frida = await import("frida");
     await mkdir(data, { recursive: true, mode: 0o700 });
     const executable = await this.executable();
+    if (existsSync(adapterPath)) {
+      if ((await sha(join(executable, "../libowl.so"))) !== owlHash)
+        throw new APIError(
+          "unsupported_build",
+          "Native coroutine library does not match the pinned build",
+        );
+      this.downloadArtifact = await sha(adapterPath);
+      try {
+        const path = join(data, "download-verified.json"),
+          info = await stat(path);
+        if (info.size <= 4096 && info.uid === process.getuid?.() && !(info.mode & 0o077)) {
+          const proof = JSON.parse(await readFile(path, "utf8"));
+          if (
+            proof.adapter === this.downloadArtifact &&
+            proof.client === profile.artifact.sha256 &&
+            proof.owl === owlHash &&
+            typeof proof.account === "string"
+          )
+            this.downloadAccount = proof.account;
+        }
+      } catch {}
+    }
     this.xvfb = Bun.spawn(
       ["Xvfb", "-displayfd", "1", "-screen", "0", "1280x900x24", "-nolisten", "tcp"],
       { stdout: "pipe", stderr: "ignore" },
@@ -484,6 +518,8 @@ export class Runtime {
       JSON.stringify(outbound) +
       ";\nconst SESSION=" +
       JSON.stringify(sessionProfile) +
+      ";\nconst DOWNLOAD_ADAPTER=" +
+      JSON.stringify(adapterPath) +
       ";\n" +
       (await readFile(join(root, "dist/native/instrument.js"), "utf8"));
     this.script = await this.session.createScript(source);
@@ -597,6 +633,12 @@ export class Runtime {
     }
   }
   async dispatch(method: string, params: Row = {}) {
+    if (method === "download.validate") return this.validateDownload(params);
+    if (method === "download.status")
+      return {
+        enabled: this.downloadAccount === this.account && !!this.account,
+        adapter_available: !!this.downloadArtifact,
+      };
     if (method === "send.inspect")
       return this.operation(() => this.native("traces", params.enabled, params.clear));
     if (method === "status") return this.status;
@@ -684,7 +726,29 @@ export class Runtime {
     });
     if (voice) return voiceAudioProcess(voice);
     if (message.kind === "channels") return sharedCardAsset(message, join(data, "media"));
-    if (message.kind === "image") return receivedImage(message);
+    if (message.kind === "image") {
+      try {
+        return await receivedImage(message);
+      } catch (error) {
+        if (
+          error instanceof APIError &&
+          error.code === "media_unavailable" &&
+          this.downloadAccount &&
+          message.account_id === this.account &&
+          this.account === this.downloadAccount &&
+          this.status.state === "logged_in" &&
+          /^[1-9]\d{0,19}$/.test(message.id) &&
+          BigInt(message.id) <= 0xffffffffffffffffn &&
+          /^[a-f0-9]{32}$/.test(attachmentChecksum(message))
+        ) {
+          this.downloadRetries.request(
+            JSON.stringify([message.account_id, message.chat_id, message.id]),
+            () => this.requestNativeDownload(message, false),
+          );
+        }
+        throw error;
+      }
+    }
     if (message.kind === "file") return receivedFile(message);
     if (message.kind === "video") return receivedVideo(message);
     return stickerImage(message, join(data, "media"));
@@ -702,6 +766,106 @@ export class Runtime {
       if (!(error instanceof APIError) || error.code !== "media_unavailable") throw error;
     }
     return sharedCardAsset(message, join(data, "media"), true);
+  }
+  private async requestNativeDownload(message: Message, smoke: boolean) {
+    await this.native("downloadinit");
+    const generation = await this.operation(async () => {
+      const state = await this.native("status");
+      const dbs: Database[] = await this.native("databases");
+      const accounts = new Set(
+        dbs
+          .filter((d) => d.active && d.readable)
+          .map((d) => databaseAccount(d.path))
+          .filter(Boolean),
+      );
+      if (
+        !state.logged_in ||
+        this.account !== message.account_id ||
+        accounts.size !== 1 ||
+        !accounts.has(message.account_id) ||
+        !state.download_generation
+      )
+        throw new APIError("not_ready", "WeChat account changed before native download");
+      return state.download_generation;
+    });
+    return this.native(
+      "downloadimage",
+      message.account_id,
+      message.chat_id,
+      message.id,
+      smoke,
+      generation,
+    );
+  }
+  private async validateDownload(params: Row) {
+    if (!this.downloadArtifact) throw new APIError("not_ready", "Native adapter is unavailable");
+    const message = await this.operation(async () => {
+      if (this.status.state !== "logged_in" || !this.sendReady)
+        throw new APIError("not_ready", "WeChat is still initializing");
+      if (typeof params.chat_id !== "string" || typeof params.message_id !== "string")
+        throw new APIError("invalid_params", "An incoming image is required");
+      const message = await this.store.message(params.chat_id, params.message_id);
+      if (
+        message.account_id !== this.account ||
+        message.kind !== "image" ||
+        !/^[1-9]\d{0,19}$/.test(message.id) ||
+        BigInt(message.id) > 0xffffffffffffffffn ||
+        !/^[a-f0-9]{32}$/.test(attachmentChecksum(message))
+      )
+        throw new APIError(
+          "invalid_params",
+          "An incoming image with original metadata is required",
+        );
+      return message;
+    });
+    let missing = false;
+    try {
+      await receivedImage(message);
+    } catch (error) {
+      if (error instanceof APIError && error.code === "media_unavailable") missing = true;
+      else throw error;
+    }
+    if (!missing)
+      throw new APIError("invalid_params", "Choose an image whose original is not cached");
+    const smoke = await this.requestNativeDownload(message, true);
+    if (!smoke.smoke) throw new APIError("native_error", "Native coroutine smoke test failed");
+    const requested = await this.requestNativeDownload(message, false);
+    if (!requested.requested)
+      throw new APIError("native_error", "Native original request was rejected");
+    for (let attempt = 0; attempt < 60; attempt++) {
+      if (
+        this.status.state !== "logged_in" ||
+        this.account !== message.account_id ||
+        !(await this.native("status")).logged_in
+      )
+        throw new APIError("not_ready", "WeChat account changed during validation");
+      try {
+        const original = await receivedImage(message);
+        await privateWrite(
+          join(data, "download-verified.json"),
+          JSON.stringify({
+            adapter: this.downloadArtifact,
+            client: profile.artifact.sha256,
+            owl: owlHash,
+            account: message.account_id,
+          }),
+        );
+        this.downloadAccount = message.account_id;
+        return {
+          smoke: true,
+          original_verified: true,
+          bytes: original.bytes.length,
+          automatic_downloads: true,
+        };
+      } catch (error) {
+        if (!(error instanceof APIError) || error.code !== "media_unavailable") throw error;
+      }
+      await sleep(1000);
+    }
+    throw new APIError(
+      "media_unavailable",
+      "Native request did not produce a verified original; automatic requests remain disabled",
+    );
   }
   async close() {
     if (this.stopped) return;

@@ -11,6 +11,5 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "scripts/download-client.ts"],
-  "exclude": ["src/native/instrument.ts", "src/native/session.ts", "src/native/uploads.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "scripts/download-client.ts"]
 }

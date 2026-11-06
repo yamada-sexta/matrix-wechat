@@ -9,6 +9,7 @@ The services run in **two separate containers**:
 | `packages/wechat-runtime` | Runs WeChat, owns account files, exposes its authenticated API and optional React web UI | `packages/wechat-runtime/Dockerfile` | `18742` web UI, `18743` internal API |
 | `packages/matrix-bridge` | Matrix appservice, room mappings, history cursors, and send tracking | `packages/matrix-bridge/Dockerfile` | `17778` appservice |
 | `packages/wechat-rpc` | Shared tRPC contract, types, and client; no container | — | — |
+| `packages/wechat-native` | Frida instrumentation, pinned native profiles, and C++ download adapter; bundled into the runtime | — | — |
 
 The bridge calls the runtime over HTTP. It does not launch WeChat, access account files, or import native runtime code. Bridge state is stored with `bun:sqlite` under `data/bridge`; WeChat account state stays under `data/wechat`. The web UI belongs to the runtime container.
 
@@ -79,7 +80,7 @@ CLI options: `-c <config>`, `-r <registration>`, `-g` (generate registration), `
 
 ## Development and images
 
-Run dependency installation from the repository root; all three packages share its Bun lockfile.
+Run dependency installation from the repository root; all four packages share its Bun lockfile.
 
 ```sh
 bun install --frozen-lockfile

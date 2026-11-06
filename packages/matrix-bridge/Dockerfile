@@ -4,6 +4,7 @@ COPY package.json bun.lock ./
 COPY packages/wechat-rpc/package.json ./packages/wechat-rpc/package.json
 COPY packages/matrix-bridge/package.json ./packages/matrix-bridge/package.json
 COPY packages/wechat-runtime/package.json ./packages/wechat-runtime/package.json
+COPY packages/wechat-native/package.json ./packages/wechat-native/package.json
 
 FROM manifests AS build
 RUN bun install --frozen-lockfile --filter matrix-wechat-bridge --filter wechat-rpc

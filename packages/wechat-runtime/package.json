@@ -5,7 +5,7 @@
   "scripts": {
     "start": "bun src/server.ts",
     "build": "bun src/build.ts",
-    "check": "tsc --noEmit && tsc -p src/native/tsconfig.json",
+    "check": "tsc --noEmit",
     "test": "bun test tests",
     "lint": "biome check src tests scripts/adb-login.ts scripts/download-client.ts biome.json package.json tsconfig.json",
     "format": "biome check --write src tests scripts/adb-login.ts scripts/download-client.ts biome.json package.json tsconfig.json"
@@ -23,12 +23,12 @@
     "silk-wasm": "^3.7.1",
     "zod": "^4.6.7",
     "wechat-rpc": "workspace:*",
-    "@trpc/server": "11.19.0"
+    "@trpc/server": "11.19.0",
+    "wechat-native": "workspace:*"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.15",
     "@types/bun": "^1.4.3",
-    "@types/frida-gum": "^19.12.0",
     "@types/pngjs": "^6.0.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",

@@ -20,6 +20,17 @@
         "typescript": "^7.0.2",
       },
     },
+    "packages/wechat-native": {
+      "name": "wechat-native",
+      "dependencies": {
+        "zod": "^4.6.7",
+      },
+      "devDependencies": {
+        "@biomejs/biome": "^2.5.15",
+        "@types/frida-gum": "^19.12.0",
+        "typescript": "^7.0.2",
+      },
+    },
     "packages/wechat-rpc": {
       "name": "wechat-rpc",
       "dependencies": {
@@ -44,13 +55,13 @@
         "react": "^19.3.0",
         "react-dom": "^19.3.0",
         "silk-wasm": "^3.7.1",
+        "wechat-native": "workspace:*",
         "wechat-rpc": "workspace:*",
         "zod": "^4.6.7",
       },
       "devDependencies": {
         "@biomejs/biome": "^2.5.15",
         "@types/bun": "^1.4.3",
-        "@types/frida-gum": "^19.12.0",
         "@types/pngjs": "^6.0.5",
         "@types/react": "^19.3.0",
         "@types/react-dom": "^19.3.0",
@@ -608,6 +619,8 @@
     "utils-merge": ["utils-merge@1.0.1", "", {}, "sha512-pMZTvIkT1d+TFGvDOqodOclx0QWkkgi6Tdoa8gC8ffGAAqz9pzPTZWAybbsHHoED/ztMtkv/VoYTYyShUn81hA=="],
 
     "vary": ["vary@1.1.2", "", {}, "sha512-BNGbWLfd0eUPabhkXUVm0j8uuvREyTh5ovRa/dyow/BqAbZJyC+5fU+IzQOzmAKzYqYRAISoRhdQr3eIZ/PXqg=="],
+
+    "wechat-native": ["wechat-native@workspace:packages/wechat-native"],
 
     "wechat-rpc": ["wechat-rpc@workspace:packages/wechat-rpc"],
 

@@ -1,3 +1,4 @@
+import { createDownloader } from "./download";
 import { createSession } from "./session";
 import { createUploadHooks } from "./uploads";
 
@@ -5,6 +6,7 @@ import { createUploadHooks } from "./uploads";
 
 const base = Process.mainModule.base;
 const nullPtr = ptr(0);
+const imageDownloads = createDownloader();
 interface DatabaseConnection {
   id: string;
   db: NativePointer;
@@ -337,7 +339,25 @@ for (const name of ["close", "close_v2"])
       }
     },
   });
-const session = createSession((kind) => hint(kind, {}));
+const session = createSession((kind) => {
+  imageDownloads.invalidate();
+  hint(kind, {});
+});
+let previousLogin: boolean | undefined;
+function sessionState() {
+  const state = session.status();
+  if (previousLogin !== undefined && previousLogin !== state.logged_in) imageDownloads.invalidate();
+  previousLogin = state.logged_in;
+  return state;
+}
+function accountMatches(account: string) {
+  const accounts = new Set(
+    [...connections.values()]
+      .map((c) => c.path.match(/\/xwechat_files\/([^/]+)_[a-f0-9]{4}\/db_storage\//i)?.[1])
+      .filter(Boolean),
+  );
+  return accounts.size === 1 && accounts.has(account);
+}
 function sqlQuery(db: NativePointer, sql: string, maxRows: number, allowWrite = false) {
   const holder = Memory.alloc(Process.pointerSize);
   holder.writePointer(nullPtr);
@@ -498,7 +518,7 @@ function scanQR() {
 // Executed inside Frida; input and callback lifetimes are retained explicitly.
 const outboundPending = new Map<string, PendingSend>();
 let outboundSequence = 0;
-const outboundQueue: (() => void)[] = [];
+const outboundQueue: ((context: NativePointer) => void)[] = [];
 let drainingOutbound = false;
 // Outbound wrappers require the native worker's thread-local account context;
 // Qt's GUI thread cannot send. Probe the factory's validated epilogue after its
@@ -514,9 +534,10 @@ if (
   throw Error("Unsupported native account dispatch epilogue");
 Interceptor.attach(accountReady, function () {
   if (drainingOutbound || !outboundQueue.length) return;
+  let output: NativePointer;
   try {
-    const output = (this.context as X64CpuContext).rbx,
-      context = output.readPointer();
+    output = (this.context as X64CpuContext).rbx;
+    const context = output.readPointer();
     if (context.isNull() || context.add(0x28).readPointer().isNull()) return;
   } catch (_) {
     return;
@@ -524,7 +545,7 @@ Interceptor.attach(accountReady, function () {
   const job = outboundQueue.shift();
   drainingOutbound = true;
   try {
-    job?.();
+    job?.(output);
   } finally {
     drainingOutbound = false;
   }
@@ -846,6 +867,51 @@ function nativeQuote(
 }
 
 rpc.exports = {
+  downloadinit: imageDownloads.initialize,
+  downloadimage(account: unknown, chat: unknown, id: unknown, smoke: unknown, generation: unknown) {
+    if (
+      typeof chat !== "string" ||
+      !chat ||
+      unescape(encodeURIComponent(chat)).length > 256 ||
+      /[\x00-\x1f\x7f]/.test(chat) ||
+      typeof id !== "string" ||
+      !/^[1-9]\d{0,19}$/.test(id) ||
+      new UInt64(id).toString() !== id ||
+      typeof smoke !== "boolean"
+    )
+      throw Error("Invalid image download request");
+    if (
+      typeof account !== "string" ||
+      !account ||
+      typeof generation !== "number" ||
+      !Number.isInteger(generation) ||
+      generation <= 0 ||
+      generation >= 0xffffffff ||
+      !sessionState().logged_in ||
+      !accountMatches(account) ||
+      generation !== imageDownloads.generation()
+    )
+      throw Error("WeChat account changed before download");
+    return new Promise((resolve, reject) => {
+      if (outboundQueue.length >= 16) return reject(Error("Native account queue full"));
+      let cancelled = false;
+      const timer = setTimeout(() => {
+        cancelled = true;
+        reject(Error("Native account thread did not accept the download"));
+      }, 30000);
+      outboundQueue.push((context) => {
+        if (cancelled) return;
+        clearTimeout(timer);
+        if (
+          !sessionState().logged_in ||
+          !accountMatches(account) ||
+          generation !== imageDownloads.generation()
+        )
+          return reject(Error("WeChat account changed before download"));
+        void imageDownloads.request(context, chat, id, smoke, generation).then(resolve, reject);
+      });
+    });
+  },
   traces(enabled: unknown, clear: unknown) {
     traceSends = enabled === true;
     if (clear) sendTraces.length = 0;
@@ -939,7 +1005,8 @@ rpc.exports = {
   status() {
     return {
       sqlite_version: text(native.libversion()),
-      ...session.status(),
+      ...sessionState(),
+      download_generation: imageDownloads.generation(),
       revision,
       databases: connections.size,
     };

@@ -1,15 +1,15 @@
 import { expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
-import { outboundProfileSchema } from "../src/native/profiles";
+import { outboundProfileSchema } from "wechat-native/profiles";
 
 const profile = outboundProfileSchema.parse(
   Bun.TOML.parse(
-    await readFile(new URL("../src/native/outbound_profile.toml", import.meta.url), "utf8"),
+    await readFile(new URL(import.meta.resolve("wechat-native/outbound_profile.toml")), "utf8"),
   ),
 );
 const bundle = await Bun.build({
-  entrypoints: [new URL("../src/native/uploads.ts", import.meta.url).pathname],
+  entrypoints: [new URL(import.meta.resolve("wechat-native/uploads")).pathname],
   target: "browser",
   format: "cjs",
 });

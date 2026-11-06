@@ -4,9 +4,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends squashfs-tools 
     && rm -rf /var/lib/apt/lists/*
 ARG WECHAT_APPIMAGE_URL=https://github.com/yamada-sexta/matrix-wechat/releases/download/wechat-client-4.1.13-4526180b/WeChatLinux_x86_64.AppImage
 COPY packages/wechat-runtime/scripts/download-client.ts /tmp/download-client.ts
-COPY packages/wechat-runtime/src/native/storage_profile.toml /tmp/storage_profile.toml
+COPY packages/wechat-native/src/storage_profile.toml /tmp/storage_profile.toml
 RUN bun /tmp/download-client.ts "$WECHAT_APPIMAGE_URL" /opt/wechat-client/WeChatLinux_x86_64.AppImage /tmp/storage_profile.toml /opt/wechat-client/app \
     && chmod -R a+rX,a-w /opt/wechat-client
+
+FROM docker.io/oven/bun:1.3.14 AS native-build
+RUN apt-get update && apt-get install -y --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=client /opt/wechat-client/app/opt/wechat/libowl.so /opt/native/libowl.so
+WORKDIR /opt/native
+COPY packages/wechat-native/native/ ./native/
+COPY packages/wechat-native/tests/download.cc ./tests/
+COPY packages/wechat-native/scripts/build-native.sh ./scripts/
+RUN bash scripts/build-native.sh /opt/native /opt/native
 
 FROM docker.io/oven/bun:1.3.14 AS build
 WORKDIR /opt/matrix-wechat
@@ -14,13 +24,16 @@ WORKDIR /opt/matrix-wechat
 RUN ln -sf /usr/local/bin/bun /usr/local/bin/node
 COPY package.json bun.lock ./
 COPY packages/wechat-runtime/package.json ./packages/wechat-runtime/package.json
+COPY packages/wechat-native/package.json ./packages/wechat-native/package.json
 COPY packages/wechat-rpc/package.json ./packages/wechat-rpc/package.json
 COPY packages/matrix-bridge/package.json ./packages/matrix-bridge/package.json
-RUN bun install --frozen-lockfile --filter wechat-runtime --filter wechat-rpc
+RUN bun install --frozen-lockfile --filter wechat-runtime --filter wechat-rpc --filter wechat-native
 RUN cd packages/wechat-runtime && bun -e 'const f=await import("frida");await f.getLocalDevice();console.log("Frida binding works under Bun")'
 COPY .gitignore ./
 COPY packages/wechat-rpc ./packages/wechat-rpc
 COPY packages/wechat-runtime ./packages/wechat-runtime
+COPY packages/wechat-native ./packages/wechat-native
+RUN bun run --cwd packages/wechat-native check && bun run --cwd packages/wechat-native lint
 RUN bun run --cwd packages/wechat-rpc check && bun run --cwd packages/wechat-rpc lint
 WORKDIR /opt/matrix-wechat/packages/wechat-runtime
 RUN bun run lint && bun run check && bun run test && bun run build
@@ -42,6 +55,7 @@ ENV WECHAT_INSTALL_DIR=/opt/wechat-client/app
 RUN usermod --home /home/wechat --move-home bun \
     && mkdir -p /tmp/runtime-wechat && chown bun:bun /tmp/runtime-wechat && chmod 0700 /tmp/runtime-wechat
 COPY --from=build /opt/matrix-wechat /opt/matrix-wechat
+COPY --from=native-build /opt/native/download.so /opt/matrix-wechat/packages/wechat-runtime/dist/native/download.so
 # Verify the prepared client through the application without starting WeChat.
 RUN bun -e 'import {Runtime} from "./src/runtime.ts";console.log(await new Runtime().executable())'
 ENV HOME=/home/wechat XDG_RUNTIME_DIR=/tmp/runtime-wechat

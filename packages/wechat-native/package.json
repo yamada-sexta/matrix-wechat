@@ -1,0 +1,26 @@
+{
+  "name": "wechat-native",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./profiles": "./src/profiles.ts",
+    "./instrument": "./src/instrument.ts",
+    "./uploads": "./src/uploads.ts",
+    "./storage_profile.toml": "./src/storage_profile.toml",
+    "./outbound_profile.toml": "./src/outbound_profile.toml",
+    "./session_profile.toml": "./src/session_profile.toml"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "lint": "biome check src biome.json package.json tsconfig.json",
+    "format": "biome check --write src biome.json package.json tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/frida-gum": "^19.12.0",
+    "typescript": "^7.0.2",
+    "@biomejs/biome": "^2.5.15"
+  }
+}

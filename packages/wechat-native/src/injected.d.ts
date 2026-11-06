@@ -5,4 +5,5 @@ declare global {
   const PROFILE: StorageProfile;
   const OUTBOUND: OutboundProfile;
   const SESSION: SessionProfile;
+  const DOWNLOAD_ADAPTER: string;
 }

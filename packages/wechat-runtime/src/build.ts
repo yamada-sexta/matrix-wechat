@@ -1,8 +1,9 @@
 import { mkdir, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 await mkdir("dist/web", { recursive: true });
 for (const [entry, outdir, target] of [
-  ["src/native/instrument.ts", "dist/native", "browser"],
+  [fileURLToPath(import.meta.resolve("wechat-native/instrument")), "dist/native", "browser"],
   ["src/web/app.tsx", "dist/web", "browser"],
 ] as const) {
   const result = await Bun.build({

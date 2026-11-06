@@ -19,7 +19,7 @@ def changed_images(paths, force=False):
             selected.update(("matrix-bridge", "wechat-runtime"))
         elif path == "example-config.yaml" or path.startswith("packages/matrix-bridge/"):
             selected.add("matrix-bridge")
-        elif path.startswith("packages/wechat-runtime/"):
+        elif path.startswith(("packages/wechat-runtime/", "packages/wechat-native/")):
             selected.add("wechat-runtime")
     if force:
         selected.update(("matrix-bridge", "wechat-runtime"))
