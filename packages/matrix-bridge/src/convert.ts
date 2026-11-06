@@ -154,8 +154,8 @@ export function incoming(
         mimetype: asset.type,
         size: asset.bytes.length,
         ...dimensions(asset.bytes, asset.type),
-        ...(message.media?.width ? { w: message.media.width } : {}),
-        ...(message.media?.height ? { h: message.media.height } : {}),
+        ...(!asset.preview && message.media?.width ? { w: message.media.width } : {}),
+        ...(!asset.preview && message.media?.height ? { h: message.media.height } : {}),
         ...(message.media?.duration ? { duration: message.media.duration } : {}),
         ...(options.thumbnailMxc && options.thumbnail
           ? {
@@ -169,6 +169,10 @@ export function incoming(
           : {}),
       },
     };
+    if (asset.preview) {
+      content.filename = content.body;
+      content.body += " (WeChat thumbnail; original not downloaded)";
+    }
     if (message.link) {
       content.filename = content.body;
       content.body = [message.link.title, message.link.description, message.link.source]

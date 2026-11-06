@@ -377,6 +377,16 @@ export class WeChatBridge {
         if (!["not_found", "media_unavailable", "unsupported"].includes(errorCode(error) || ""))
           throw error;
         missingMedia = errorCode(error) !== "unsupported";
+        if (missingMedia && message.kind === "image") {
+          try {
+            asset = {
+              ...(await this.runtime.asset("thumbnail", { chat: message.chat_id, id: message.id })),
+              preview: true,
+            };
+          } catch (error) {
+            if (!["not_found", "media_unavailable"].includes(errorCode(error) || "")) throw error;
+          }
+        }
       }
       if (asset) mxc = await this.assetUpload(asset.bytes, asset.type, asset.name);
     }
@@ -406,6 +416,7 @@ export class WeChatBridge {
         owner: this.config.bridge.owner,
       }),
       missingMedia,
+      preview: !!asset?.preview,
     };
   }
   private held(message: Message) {
@@ -453,7 +464,12 @@ export class WeChatBridge {
           ? this.config.bridge.owner
           : await this.joinGhost(portal.room, message.sender_id));
     const converted = await this.content(message);
-    if (existing?.fingerprint === fingerprint && converted.missingMedia) return true;
+    if (
+      existing?.fingerprint === fingerprint &&
+      converted.missingMedia &&
+      (!converted.preview || this.store.meta(`media_preview:${existing.event}`) === "true")
+    )
+      return true;
     const originalType = existing ? this.store.meta(`message_type:${existing.event}`) : undefined;
     const edit = existing && originalType !== "m.sticker" && converted.type !== "m.sticker";
     const content = edit
@@ -499,6 +515,7 @@ export class WeChatBridge {
       converted.missingMedia,
     );
     this.store.setMeta(`message_type:${edit ? existing.event : event}`, converted.type);
+    this.store.setMeta(`media_preview:${edit ? existing.event : event}`, String(converted.preview));
     return true;
   }
   private async confirmPending(chat: string, recent: Message[]) {
@@ -604,13 +621,24 @@ export class WeChatBridge {
     }
   }
   private async retryMedia() {
-    for (const row of this.store.all<Mapping>(
-      "SELECT * FROM messages WHERE account=? AND media_retry=1 AND redacted=0 ORDER BY rowid LIMIT 10",
+    const cursorKey = `media_retry_cursor:${this.account}`;
+    const rows = this.store.all<Mapping & { retry_rowid: number }>(
+      "SELECT rowid AS retry_rowid,* FROM messages WHERE account=? AND media_retry=1 AND redacted=0 AND rowid>? ORDER BY rowid LIMIT 10",
       this.account,
-    )) {
-      const portal = this.store.portal(this.account, row.chat);
-      if (portal) await this.receive(JSON.parse(row.payload), portal);
+      Number(this.store.meta(cursorKey)) || 0,
+    );
+    for (const row of rows) {
+      // Advance even when this attachment is unavailable or an individual read fails.
+      this.store.setMeta(cursorKey, String(row.retry_rowid));
+      try {
+        const portal = this.store.portal(this.account, row.chat);
+        if (portal) await this.receive(JSON.parse(row.payload), portal);
+      } catch (error) {
+        this.lastError = errorCode(error) || "media_retry_failed";
+        console.error("Bridge media retry:", this.lastError);
+      }
     }
+    if (rows.length < 10) this.store.setMeta(cursorKey, "0");
   }
   private async command(event: MatrixEvent, text: string) {
     const [command, ...args] = text.trim().split(/\s+/);

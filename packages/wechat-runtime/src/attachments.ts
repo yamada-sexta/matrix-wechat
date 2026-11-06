@@ -85,14 +85,29 @@ export function decodeImageV2(bytes: Buffer, key: Buffer, xor: number) {
 }
 
 export async function receivedImage(message: Message, home = "/home/wechat") {
+  return cachedImage(message, home, false);
+}
+
+export async function receivedImageThumbnail(message: Message, home = "/home/wechat") {
+  return cachedImage(message, home, true);
+}
+
+async function cachedImage(message: Message, home: string, thumbnail: boolean) {
   const account = accountDirectory(message, home),
-    expected = String(metadata(message).img?.md5 || "");
+    image = metadata(message).img,
+    expected = String(image?.md5 || ""),
+    thumbnailSize = Number(image?.cdnthumblength);
   const packed = message.native?.row?.packed_info_data?.base64;
   const cacheID = packed
     ? protobufPath(Buffer.from(packed, "base64"), [3, 4])?.toString()
     : undefined;
   if (!cacheID || !/^[a-f0-9]{32}$/i.test(cacheID) || !/^[a-f0-9]{32}$/i.test(expected))
     throw new APIError("media_unavailable", "Image cache mapping is unavailable");
+  if (
+    thumbnail &&
+    (!Number.isSafeInteger(thumbnailSize) || thumbnailSize <= 0 || thumbnailSize > 64 * 1024 * 1024)
+  )
+    throw new APIError("media_unavailable", "Image thumbnail metadata is unavailable");
   const suffix = basename(account).slice(-4),
     keys = new Set<string>();
   for (const file of await readdir(join(home, ".xwechat/net/kvcomm"))) {
@@ -100,7 +115,7 @@ export async function receivedImage(message: Message, home = "/home/wechat") {
     if (uin && md5(uin).slice(0, 4) === suffix) keys.add(uin);
   }
   for (const month of months(message))
-    for (const ending of ["_h.dat", ".dat"]) {
+    for (const ending of thumbnail ? ["_t.dat"] : ["_h.dat", ".dat"]) {
       let encoded: Buffer;
       try {
         encoded = await cachedBytes(
@@ -116,13 +131,20 @@ export async function receivedImage(message: Message, home = "/home/wechat") {
           const key = Buffer.from(md5(uin + message.account_id).slice(0, 16));
           const bytes = decodeImageV2(encoded, key, Number(uin) & 255),
             type = imageType(bytes);
-          if (type && md5(bytes) === expected.toLowerCase()) return { bytes, type };
+          // A thumbnail has its own bytes, not the original image's checksum.
+          if (
+            type &&
+            (thumbnail ? bytes.length === thumbnailSize : md5(bytes) === expected.toLowerCase())
+          )
+            return { bytes, type };
         } catch {}
       }
     }
   throw new APIError(
     "media_unavailable",
-    "Original image is not downloaded or could not be verified",
+    thumbnail
+      ? "Image thumbnail is not downloaded or could not be verified"
+      : "Original image is not downloaded or could not be verified",
   );
 }
 

@@ -12,6 +12,7 @@ export interface Asset {
   bytes: Buffer;
   type: string;
   name?: string;
+  preview?: boolean;
 }
 export function checksum(bytes: Buffer) {
   return new Bun.CryptoHasher("md5").update(bytes).digest("hex");

@@ -56,7 +56,7 @@ Incoming messages include text, replies, mentions, images, stickers/GIFs, cached
 
 Transfers and red packets are **read only**: Matrix receives a formatted card with the available amount, memo or greeting, and a read-only label. The bridge cannot collect a transfer or open a red packet. They can be quoted like other normal messages; system messages cannot be quoted. Card layouts use [Matrix-supported HTML](https://spec.matrix.org/v1.19/client-server-api/#mroommessage-msgtypes), with plain-text fallbacks and link-preview metadata for clients that support it; appearance varies by Matrix client.
 
-Missing cached media produces a readable placeholder and is retried. Explicit revocations redact the corresponding Matrix event; disappearance from storage does not imply revocation.
+Missing cached media produces a readable placeholder and is retried in rotating batches. When an image has only a cached thumbnail, the bridge shows a labeled preview. Once WeChat caches the verified original, the bridge edits the existing Matrix message to include it, including after a bridge restart. Explicit revocations redact the corresponding Matrix event; disappearance from storage does not imply revocation.
 
 Outgoing support covers text, text replies, JPEG/PNG/GIF images, files, and MP4 through the existing file-upload route. Native acknowledgement is not delivery confirmation: the bridge waits for a matching source record with a server ID and suppresses its echo. Ambiguous or interrupted sends are reported as uncertain and are never automatically resubmitted, including when an API connection fails during a send.
 

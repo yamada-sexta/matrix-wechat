@@ -16,6 +16,7 @@ import {
   attachmentChecksum,
   receivedFile,
   receivedImage,
+  receivedImageThumbnail,
   receivedThumbnail,
   receivedVideo,
 } from "./attachments";
@@ -694,6 +695,7 @@ export class Runtime {
         throw new APIError("not_ready", "WeChat is still signing in");
       return this.store.message(chat, id);
     });
+    if (message.kind === "image") return receivedImageThumbnail(message);
     try {
       return await receivedThumbnail(message);
     } catch (error) {
