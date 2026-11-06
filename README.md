@@ -57,13 +57,13 @@ Incoming messages include text, replies, mentions, images, stickers/GIFs, cached
 
 Transfers and red packets are **read only**: Matrix receives a formatted card with the available amount, memo or greeting, and a read-only label. The bridge cannot collect a transfer or open a red packet. They can be quoted like other normal messages; system messages cannot be quoted. Card layouts use [Matrix-supported HTML](https://spec.matrix.org/v1.19/client-server-api/#mroommessage-msgtypes), with plain-text fallbacks and link-preview metadata for clients that support it; appearance varies by Matrix client.
 
-Missing cached media produces a readable placeholder and is retried in rotating batches. When an image has only a cached thumbnail, the bridge shows a labeled preview. Once WeChat caches the verified original, the bridge edits the existing Matrix message to include it, including after a bridge restart. Explicit revocations redact the corresponding Matrix event; disappearance from storage does not imply revocation.
+Missing cached media produces a readable placeholder and is retried in rotating batches. When an image has only a cached thumbnail, the bridge shows a labeled preview. After the runtime's native download validation succeeds, it requests missing image originals through WeChat's own coroutine queue. Once the original passes checksum verification, the bridge edits the existing Matrix message to include it, including after a bridge restart. Explicit revocations redact the corresponding Matrix event; disappearance from storage does not imply revocation.
 
 Outgoing support covers text, text replies, JPEG/PNG/GIF images, files, and MP4 through the existing file-upload route. Native acknowledgement is not delivery confirmation: the bridge waits for a matching source record with a server ID and suppresses its echo. Ambiguous or interrupted sends are reported as uncertain and are never automatically resubmitted, including when an API connection fails during a send.
 
 Matrix emoji reactions are sent as quoted text replies containing the reaction emoji. The reacted-to message must have a confirmed WeChat message ID in that conversation.
 
-Sticker/voice/location sending, native mention construction, native revocation, group/profile mutations, presence, encrypted Matrix rooms, and uncached-media download initiation are unsupported. Unplayable Channels video remains a cover card. Leaving a Matrix room does not leave its WeChat group. No additional native capabilities are implemented here.
+Sticker/voice/location sending, native mention construction, native revocation, group/profile mutations, presence, encrypted Matrix rooms, and uncached video/file download initiation are unsupported. Unplayable Channels video remains a cover card. Leaving a Matrix room does not leave its WeChat group.
 
 ## Commands
 
