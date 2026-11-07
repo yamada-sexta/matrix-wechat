@@ -4,6 +4,7 @@
   "type": "module",
   "exports": {
     "./profiles": "./src/profiles.ts",
+    "./changes": "./src/changes.ts",
     "./instrument": "./src/instrument.ts",
     "./uploads": "./src/uploads.ts",
     "./storage_profile.toml": "./src/storage_profile.toml",

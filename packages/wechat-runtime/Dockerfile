@@ -9,13 +9,15 @@ RUN bun /tmp/download-client.ts "$WECHAT_APPIMAGE_URL" /opt/wechat-client/WeChat
     && chmod -R a+rX,a-w /opt/wechat-client
 
 FROM docker.io/oven/bun:1.3.14 AS native-build
-RUN apt-get update && apt-get install -y --no-install-recommends g++ \
+RUN apt-get update && apt-get install -y --no-install-recommends g++ libsqlite3-dev locales \
+    && localedef -i de_DE -f UTF-8 de_DE.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=client /opt/wechat-client/app/opt/wechat/libowl.so /opt/native/libowl.so
 WORKDIR /opt/native
 COPY packages/wechat-native/native/ ./native/
-COPY packages/wechat-native/tests/download.cc ./tests/
+COPY packages/wechat-native/tests/ ./tests/
 COPY packages/wechat-native/scripts/build-native.sh ./scripts/
+COPY packages/wechat-runtime/scripts/verify-native-query.ts /opt/wechat-runtime/scripts/
 RUN bash scripts/build-native.sh /opt/native /opt/native
 
 FROM docker.io/oven/bun:1.3.14 AS build
@@ -56,6 +58,7 @@ RUN usermod --home /home/wechat --move-home bun \
     && mkdir -p /tmp/runtime-wechat && chown bun:bun /tmp/runtime-wechat && chmod 0700 /tmp/runtime-wechat
 COPY --from=build /opt/matrix-wechat /opt/matrix-wechat
 COPY --from=native-build /opt/native/download.so /opt/matrix-wechat/packages/wechat-runtime/dist/native/download.so
+COPY --from=native-build /opt/native/query.so /opt/matrix-wechat/packages/wechat-runtime/dist/native/query.so
 # Verify the prepared client through the application without starting WeChat.
 RUN bun -e 'import {Runtime} from "./src/runtime.ts";console.log(await new Runtime().executable())'
 ENV HOME=/home/wechat XDG_RUNTIME_DIR=/tmp/runtime-wechat

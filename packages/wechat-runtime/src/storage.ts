@@ -25,6 +25,7 @@ const xmlParser = new XMLParser({
   parseTagValue: false,
   processEntities: true,
 });
+export type ChangeScope = ReadonlyMap<string, ReadonlySet<string> | null>;
 function xml(value: any): Row | undefined {
   if (typeof value !== "string" || value.length > 2097152 || /<!DOCTYPE|<!ENTITY/i.test(value))
     return;
@@ -35,7 +36,10 @@ function xml(value: any): Row | undefined {
   }
 }
 export class Storage {
-  private schema = new Map<string, Map<string, string[]>>();
+  private schema = new Map<
+    string,
+    { id: string; version: string; tables: Map<string, string[]>; triggers: boolean }
+  >();
   private snapshot: Map<string, Message> | undefined;
   private snapshotAccount = "";
   private paths = new Set<string>();
@@ -44,8 +48,9 @@ export class Storage {
     private native: NativeDB,
     private account: () => string,
   ) {}
-  invalidate() {
-    this.schema.clear();
+  invalidate(path?: string) {
+    if (path) this.schema.delete(path);
+    else this.schema.clear();
   }
   async databases() {
     const account = this.account();
@@ -62,13 +67,19 @@ export class Storage {
     return r.rows.map((row) => Object.fromEntries(r.columns.map((c, i) => [c, row[i]])));
   }
   async tables(db: Database) {
+    const version = String((await this.query(db, "PRAGMA schema_version", 1))[0]?.schema_version);
     const cached = this.schema.get(db.path);
-    if (cached) return cached;
+    if (cached?.id === db.id && cached.version === version) return cached.tables;
     const map = new Map<string, string[]>();
+    let triggers = false;
     for (const row of await this.query(
       db,
-      "SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+      "SELECT name,sql,type FROM sqlite_master WHERE type IN ('table','trigger') AND name NOT LIKE 'sqlite_%'",
     )) {
+      if (row.type === "trigger") {
+        triggers = true;
+        continue;
+      }
       if (/virtual table/i.test(row.sql || "") || /fts/i.test(row.name)) continue;
       map.set(
         row.name,
@@ -77,7 +88,9 @@ export class Storage {
         ),
       );
     }
-    this.schema.set(db.path, map);
+    if (String((await this.query(db, "PRAGMA schema_version", 1))[0]?.schema_version) !== version)
+      throw new APIError("not_ready", "Database schema changed during discovery");
+    this.schema.set(db.path, { id: db.id, version, tables: map, triggers });
     return map;
   }
   async inspect() {
@@ -402,8 +415,11 @@ export class Storage {
     }
     return [key, m];
   }
-  private async messages(chatFilter?: string) {
-    const { sources, paths } = await this.messageSources(chatFilter);
+  private async messages(chatFilter?: string, scope?: ChangeScope) {
+    const { sources, paths, scannedPaths, scannedTables } = await this.messageSources(
+      chatFilter,
+      scope,
+    );
     const messages = new Map<string, Message>();
     for (const source of sources) {
       let after = "0";
@@ -427,7 +443,7 @@ export class Storage {
         if (page.length < 500) break;
       }
     }
-    return { messages, paths };
+    return { messages, paths, scannedPaths, scannedTables };
   }
   async history(params: Row) {
     const chat = params.chat_id,
@@ -468,7 +484,7 @@ export class Storage {
           : undefined,
     };
   }
-  private async messageSources(chatFilter?: string) {
+  private async messageSources(chatFilter?: string, scope?: ChangeScope) {
     const sources: {
       db: Database;
       table: string;
@@ -477,11 +493,31 @@ export class Storage {
       projection: string;
     }[] = [];
     const paths = new Set<string>();
+    const scannedPaths = new Set<string>(),
+      scannedTables = new Set<string>();
     for (const db of await this.databases()) {
       if (!/^message_\d+\.db$/.test(basename(db.path))) continue;
       paths.add(db.path);
+      if (scope && !scope.has(db.path)) continue;
+      const previousSchema = this.schema.get(db.path);
       const tables = await this.tables(db),
         names = new Map<string, string>();
+      const requested = scope?.get(db.path);
+      const currentSchema = this.schema.get(db.path)!;
+      const narrow =
+        requested &&
+        previousSchema?.id === db.id &&
+        previousSchema.version === currentSchema.version &&
+        !currentSchema.triggers &&
+        ![...requested].some(
+          (t) =>
+            t.toLowerCase() === "name2id" ||
+            ![...tables.keys()].some((n) => n.toLowerCase() === t.toLowerCase()),
+        );
+      if (narrow)
+        for (const table of requested)
+          scannedTables.add(JSON.stringify([db.path, table.toLowerCase()]));
+      else scannedPaths.add(db.path);
       if (tables.has("Name2Id"))
         for (const row of await this.query(db, "SELECT rowid AS __id,* FROM Name2Id"))
           names.set(String(row.__id), row.user_name);
@@ -489,6 +525,7 @@ export class Storage {
       for (const [table, columns] of tables) {
         if (
           !table.toLowerCase().startsWith("msg_") ||
+          (narrow && ![...requested].some((t) => t.toLowerCase() === table.toLowerCase())) ||
           (chatFilter && table.toLowerCase() !== "msg_" + md5(chatFilter))
         )
           continue;
@@ -509,7 +546,7 @@ export class Storage {
       }
     }
     if (!paths.size) throw new APIError("not_ready", "Message history is still opening");
-    return { sources, paths };
+    return { sources, paths, scannedPaths, scannedTables };
   }
   async bridgeRecent(chat: string, limit = 50) {
     if (!chat || chat.length > 256 || !Number.isInteger(limit) || limit < 1 || limit > 500)
@@ -707,11 +744,29 @@ export class Storage {
       id: String(row.svr_id),
     }));
   }
-  async changes(): Promise<Event[]> {
-    const { messages: now, paths } = await this.messages(),
-      revoked = await this.revoked();
-    const events: Event[] = [];
+  async changes(scope?: ChangeScope): Promise<Event[]> {
     const same = this.snapshotAccount === this.account();
+    if (!this.snapshot || !same) scope = undefined;
+    const {
+      messages: changed,
+      paths,
+      scannedPaths,
+      scannedTables,
+    } = await this.messages(undefined, scope);
+    const now = scope ? new Map(this.snapshot) : new Map<string, Message>();
+    if (scope)
+      for (const [key, message] of now) {
+        const path = message.native?.database,
+          table = String(message.native?.table || "").toLowerCase();
+        if (scannedPaths.has(path) || scannedTables.has(JSON.stringify([path, table])))
+          now.delete(key);
+      }
+    for (const [key, message] of changed) now.set(key, message);
+    const revoked =
+      !scope || [...scope.keys()].some((path) => basename(path) === "general.db")
+        ? await this.revoked()
+        : this.revokes;
+    const events: Event[] = [];
     if (this.snapshot && same) {
       for (const p of this.paths)
         if (!paths.has(p))
@@ -722,7 +777,7 @@ export class Storage {
           .map((m) => [m.chat_id + "\0" + m.id, m]),
       );
       const emitted = new Set<string>();
-      for (const [key, m] of now) {
+      for (const [key, m] of scope ? changed : now) {
         const old = this.snapshot.get(key) || previousIDs.get(m.chat_id + "\0" + m.id),
           id = m.chat_id + "\0" + m.id;
         if (JSON.stringify(old) === JSON.stringify(m) || emitted.has(id)) continue;

@@ -19,6 +19,7 @@ import {
 } from "wechat-native/profiles";
 import {
   attachmentChecksum,
+  attachmentWatchDirectories,
   receivedFile,
   receivedImage,
   receivedImageThumbnail,
@@ -26,9 +27,11 @@ import {
   receivedVideo,
 } from "./attachments";
 import { voiceAudioProcess } from "./audio";
+import { ChangeJournal } from "./change-journal";
 import { DownloadRetry } from "./download-retry";
 import { loginQRImage } from "./login-qr";
 import { imageType, sharedCardAsset, stickerImage } from "./media";
+import { MediaWatch } from "./media-watch";
 import { loginRequestSchema, textMessageSchema, validateParams } from "./schemas";
 import { databaseAccount, Storage } from "./storage";
 import { APIError, type Database, type Event, type Message, type Row, type Status } from "./types";
@@ -52,8 +55,7 @@ for (const metadata of [outbound, sessionProfile])
   if (metadata.elf_sha256 !== profile.artifact.sha256)
     throw new APIError("unsupported_build", "Native profiles reference different client builds");
 
-const root = join(import.meta.dir, ".."),
-  data = process.env.WECHAT_DATA_DIR || "/home/wechat/.cache/wechatlinux";
+const root = join(import.meta.dir, "..");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const adapterPath = join(root, "dist/native/download.so");
 const owlHash = "f5d7874c73cde5cb3044668dad9374221e9fda30e7573eda143930fb4cf5560f";
@@ -77,6 +79,8 @@ function blobs(v: any): any {
   return v;
 }
 export class Runtime {
+  constructor(readonly data = process.env.WECHAT_DATA_DIR || "/home/wechat/.cache/wechatlinux") {}
+  readonly changes = new ChangeJournal();
   readonly store = new Storage(
     {
       databases: () => this.native("databases"),
@@ -96,6 +100,9 @@ export class Runtime {
   private xvfb?: Bun.Subprocess;
   private display = "";
   private dirty = true;
+  private changedDatabases = new Map<string, Set<string> | null>();
+  private fullReconcile = true;
+  private lastFullReconcile = 0;
   private baseline = false;
   private loginRequested = false;
   private autoLoginSuppressed = false;
@@ -107,6 +114,7 @@ export class Runtime {
   private downloadAccount = "";
   private downloadArtifact = "";
   private downloadRetries = new DownloadRetry();
+  private mediaWatch = new MediaWatch();
   verified = new Set<string>();
   private uploads = new Map<
     string,
@@ -149,7 +157,7 @@ export class Runtime {
     return this.operation(async () => {
       this.checkUploadReady(bytes.length);
       const token = randomUUID(),
-        directory = join(data, "uploads", token),
+        directory = join(this.data, "uploads", token),
         path = join(directory, name);
       const checksum = createHash("md5").update(bytes).digest("hex");
       await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -221,7 +229,7 @@ export class Runtime {
       const token = randomUUID();
       const started = Date.now() / 1000,
         checksum = createHash("md5").update(bytes).digest("hex");
-      const directory = join(data, "uploads"),
+      const directory = join(this.data, "uploads"),
         path = join(directory, token + "." + (type === "image/jpeg" ? "jpg" : type!.slice(6)));
       const [database] = await this.store.databases();
       const accountRoot = database.path.split("/db_storage/")[0];
@@ -301,6 +309,7 @@ export class Runtime {
     };
   }
   emit(e: Event) {
+    this.changes.append(e);
     for (const fn of this.subscribers) fn(e);
   }
   private updateStatus(status: Status) {
@@ -314,11 +323,14 @@ export class Runtime {
     this.lastQR = 0;
   }
   private clearSession() {
+    this.mediaWatch.clear();
     this.account = "";
     this.sendReady = false;
     this.baseline = false;
     this.loginRequested = false;
     this.dirty = true;
+    this.fullReconcile = true;
+    this.changedDatabases.clear();
     this.store.invalidate();
     this.clearQR();
   }
@@ -401,7 +413,7 @@ export class Runtime {
     try {
       return await this.script.exports[method](...args);
     } catch (e) {
-      await appendFile(join(data, "native-errors.log"), method + ": " + String(e) + "\n", {
+      await appendFile(join(this.data, "native-errors.log"), method + ": " + String(e) + "\n", {
         mode: 0o600,
       });
       throw new APIError("native_error", "Native operation failed");
@@ -412,7 +424,8 @@ export class Runtime {
     const imageHash = await sha(image);
     if (imageHash !== profile.artifact.appimage_sha256)
       throw new APIError("unsupported_build", "AppImage does not match the pinned SHA-256");
-    const extracted = process.env.WECHAT_INSTALL_DIR || join(data, "app-" + imageHash.slice(0, 16)),
+    const extracted =
+        process.env.WECHAT_INSTALL_DIR || join(this.data, "app-" + imageHash.slice(0, 16)),
       executable = join(extracted, "opt/wechat/wechat");
     if (!existsSync(executable)) {
       const handle = openSync(image, "r"),
@@ -449,7 +462,7 @@ export class Runtime {
     if (!existsSync("/run/.containerenv") && !existsSync("/.dockerenv"))
       throw new APIError("container_required", "WeChat must run inside its container");
     const frida = await import("frida");
-    await mkdir(data, { recursive: true, mode: 0o700 });
+    await mkdir(this.data, { recursive: true, mode: 0o700 });
     const executable = await this.executable();
     if (existsSync(adapterPath)) {
       if ((await sha(join(executable, "../libowl.so"))) !== owlHash)
@@ -459,7 +472,7 @@ export class Runtime {
         );
       this.downloadArtifact = await sha(adapterPath);
       try {
-        const path = join(data, "download-verified.json"),
+        const path = join(this.data, "download-verified.json"),
           info = await stat(path);
         if (info.size <= 4096 && info.uid === process.getuid?.() && !(info.mode & 0o077)) {
           const proof = JSON.parse(await readFile(path, "utf8"));
@@ -484,12 +497,12 @@ export class Runtime {
     this.device = await frida.getLocalDevice();
     this.device.output.connect((_pid, _fd, bytes) => {
       if (bytes.length) {
-        void stat(join(data, "client-output.log"))
+        void stat(join(this.data, "client-output.log"))
           .then((s) =>
-            s.size > 1048576 ? privateWrite(join(data, "client-output.log"), "") : undefined,
+            s.size > 1048576 ? privateWrite(join(this.data, "client-output.log"), "") : undefined,
           )
           .catch(() => {})
-          .then(() => appendFile(join(data, "client-output.log"), bytes, { mode: 0o600 }))
+          .then(() => appendFile(join(this.data, "client-output.log"), bytes, { mode: 0o600 }))
           .catch(() => {});
       }
     });
@@ -520,6 +533,8 @@ export class Runtime {
       JSON.stringify(sessionProfile) +
       ";\nconst DOWNLOAD_ADAPTER=" +
       JSON.stringify(adapterPath) +
+      ";\nconst QUERY_ADAPTER=" +
+      JSON.stringify(join(root, "dist/native/query.so")) +
       ";\n" +
       (await readFile(join(root, "dist/native/instrument.js"), "utf8"));
     this.script = await this.session.createScript(source);
@@ -535,8 +550,7 @@ export class Runtime {
             this.loginRequested = false;
             this.sendReady = false;
           }
-          this.dirty = true;
-          this.store.invalidate();
+          this.databaseChanged(p);
         }
       } else if (message.type === "error") {
         initialError = true;
@@ -557,9 +571,36 @@ export class Runtime {
     if (!image) return false;
     this.qr = image;
     this.qrAt = Date.now();
-    await privateWrite(join(data, "login-qr.png"), this.qr);
+    await privateWrite(join(this.data, "login-qr.png"), this.qr);
     this.verified.add("login.qr");
     return true;
+  }
+  private databaseChanged(change: Row) {
+    this.dirty = true;
+    const path = typeof change.path === "string" ? change.path : undefined;
+    if (!path) {
+      this.fullReconcile = true;
+      this.store.invalidate();
+      return;
+    }
+    if (change.kind !== "committed_write" || change.schema === true) this.store.invalidate(path);
+    const tables =
+      Array.isArray(change.tables) &&
+      change.tables.length <= 32 &&
+      change.tables.every((name: unknown) => typeof name === "string" && name.length <= 256)
+        ? new Set<string>(change.tables)
+        : null;
+    const previous = this.changedDatabases.get(path);
+    this.changedDatabases.set(
+      path,
+      change.schema === true || tables === null || previous === null
+        ? null
+        : new Set([...(previous || []), ...tables]),
+    );
+    if (/\/general\.db$/.test(path))
+      this.emit({ type: "revocations.updated", account_id: this.account });
+    else if (/\/(contact|session|head_image)\//.test(path))
+      this.emit({ type: "metadata.updated", account_id: this.account });
   }
   private async monitor() {
     while (!this.stopped) {
@@ -573,21 +614,32 @@ export class Runtime {
               .map((d) => databaseAccount(d.path))
               .filter(Boolean),
           );
+          const previousAccount = this.account;
           if (!state.logged_in || accounts.size > 1) this.account = "";
           else if (accounts.size === 1) this.account = [...accounts][0]!;
+          if (previousAccount !== this.account) this.mediaWatch.clear();
           this.updateSessionStatus(state);
           if (this.status.state === "logged_in") {
-            if (this.dirty || !this.baseline) {
+            if (this.dirty || !this.baseline || Date.now() - this.lastFullReconcile >= 60000) {
+              const full =
+                this.fullReconcile ||
+                !this.baseline ||
+                Date.now() - this.lastFullReconcile >= 60000;
+              const scope = full ? undefined : new Map(this.changedDatabases);
               this.dirty = false;
+              this.fullReconcile = false;
+              this.changedDatabases.clear();
               try {
-                const changes = await this.store.changes();
+                const changes = await this.store.changes(scope);
                 this.baseline = true;
+                if (full) this.lastFullReconcile = Date.now();
                 for (const event of changes) {
                   this.emit(event);
                   if (event.message) this.verified.add("receive." + event.message.kind);
                 }
               } catch (e) {
                 this.dirty = true;
+                this.fullReconcile = true;
                 if (!(e instanceof APIError) || !["not_ready"].includes(e.code))
                   console.error(
                     "Message reconciliation:",
@@ -725,11 +777,15 @@ export class Runtime {
       };
     });
     if (voice) return voiceAudioProcess(voice);
-    if (message.kind === "channels") return sharedCardAsset(message, join(data, "media"));
+    if (message.kind === "channels") return sharedCardAsset(message, join(this.data, "media"));
     if (message.kind === "image") {
       try {
-        return await receivedImage(message);
+        const asset = await receivedImage(message);
+        this.mediaWatch.remove(JSON.stringify([message.account_id, message.chat_id, message.id]));
+        return asset;
       } catch (error) {
+        if (error instanceof APIError && error.code === "media_unavailable")
+          this.watchAttachment(message);
         if (
           error instanceof APIError &&
           error.code === "media_unavailable" &&
@@ -749,9 +805,16 @@ export class Runtime {
         throw error;
       }
     }
-    if (message.kind === "file") return receivedFile(message);
-    if (message.kind === "video") return receivedVideo(message);
-    return stickerImage(message, join(data, "media"));
+    if (message.kind === "file" || message.kind === "video") {
+      try {
+        return await (message.kind === "file" ? receivedFile(message) : receivedVideo(message));
+      } catch (error) {
+        if (error instanceof APIError && error.code === "media_unavailable")
+          this.watchAttachment(message);
+        throw error;
+      }
+    }
+    return stickerImage(message, join(this.data, "media"));
   }
   async thumbnail(chat: string, id: string) {
     const message = await this.operation(() => {
@@ -765,7 +828,7 @@ export class Runtime {
     } catch (error) {
       if (!(error instanceof APIError) || error.code !== "media_unavailable") throw error;
     }
-    return sharedCardAsset(message, join(data, "media"), true);
+    return sharedCardAsset(message, join(this.data, "media"), true);
   }
   private async requestNativeDownload(message: Message, smoke: boolean) {
     await this.native("downloadinit");
@@ -796,6 +859,37 @@ export class Runtime {
       smoke,
       generation,
     );
+  }
+  private watchAttachment(message: Message) {
+    try {
+      const { root, directories } = attachmentWatchDirectories(message);
+      const read =
+        message.kind === "image"
+          ? receivedImage
+          : message.kind === "video"
+            ? receivedVideo
+            : receivedFile;
+      this.mediaWatch.watch(
+        JSON.stringify([message.account_id, message.chat_id, message.id]),
+        root,
+        directories,
+        async () => {
+          if (this.status.state !== "logged_in" || this.account !== message.account_id)
+            return false;
+          await read(message);
+          return true;
+        },
+        () => {
+          if (this.status.state === "logged_in" && this.account === message.account_id)
+            this.emit({
+              type: "media.available",
+              account_id: message.account_id,
+              chat_id: message.chat_id,
+              data: { message_id: message.id },
+            });
+        },
+      );
+    } catch {}
   }
   private async validateDownload(params: Row) {
     if (!this.downloadArtifact) throw new APIError("not_ready", "Native adapter is unavailable");
@@ -842,7 +936,7 @@ export class Runtime {
       try {
         const original = await receivedImage(message);
         await privateWrite(
-          join(data, "download-verified.json"),
+          join(this.data, "download-verified.json"),
           JSON.stringify({
             adapter: this.downloadArtifact,
             client: profile.artifact.sha256,
@@ -870,6 +964,7 @@ export class Runtime {
   async close() {
     if (this.stopped) return;
     this.stopped = true;
+    this.mediaWatch.clear();
     await Promise.all([...this.uploads.keys()].map((token) => this.cleanupUpload(token)));
     this.qr = undefined;
     try {

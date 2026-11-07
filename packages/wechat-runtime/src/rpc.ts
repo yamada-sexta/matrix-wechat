@@ -13,6 +13,7 @@ export function createRPCHandler(runtime: Runtime, token: string) {
       return fn().then(publicFields);
     });
   const backend: Backend = {
+    changes: (input) => runtime.changes.poll(input),
     status: () => ({
       status: runtime.status,
       qrAt: runtime.qrAt,
@@ -46,7 +47,10 @@ export function createRPCHandler(runtime: Runtime, token: string) {
         endpoint: "/trpc",
         req: request,
         router,
-        createContext: () => backend,
+        createContext: () => ({
+          ...backend,
+          changes: (input) => runtime.changes.poll(input, request.signal),
+        }),
       });
     if (request.method !== "GET") return new Response(null, { status: 405 });
     const headers = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" };

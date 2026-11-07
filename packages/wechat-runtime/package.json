@@ -7,8 +7,8 @@
     "build": "bun src/build.ts",
     "check": "tsc --noEmit",
     "test": "bun test tests",
-    "lint": "biome check src tests scripts/adb-login.ts scripts/download-client.ts biome.json package.json tsconfig.json",
-    "format": "biome check --write src tests scripts/adb-login.ts scripts/download-client.ts biome.json package.json tsconfig.json"
+    "lint": "biome check src tests scripts/adb-login.ts scripts/download-client.ts scripts/verify-native-query.ts biome.json package.json tsconfig.json",
+    "format": "biome check --write src tests scripts/adb-login.ts scripts/download-client.ts scripts/verify-native-query.ts biome.json package.json tsconfig.json"
   },
   "trustedDependencies": [
     "frida"

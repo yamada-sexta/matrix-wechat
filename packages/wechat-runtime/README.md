@@ -1,5 +1,7 @@
 # WeChat runtime
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Container-only WeChat Linux 4.1.13 instrumentation, Bun + TypeScript API, and React chat UI. The native executable is pinned by SHA-256.
 
 ```sh
@@ -35,7 +37,7 @@ bun run --cwd packages/wechat-runtime build
 
 The Matrix bridge runs in a separate container and connects through the shared `wechat-rpc` client. Set `WECHAT_API_TOKEN` to enable the authenticated API on port `18743`; every request requires `Authorization: Bearer <token>`. Without a token this listener is disabled. Compose supplies the same token to both services and keeps this port internal.
 
-The typed tRPC API at `/trpc` exposes status, contacts, groups, conversations, resumable history, recent messages, revocations, login and logout, text sends, and multipart image/file uploads. Reads are scoped to the current account, including its retained database shards; databases from a previous account are excluded. Authenticated `/assets/avatar`, `/assets/media`, `/assets/thumbnail`, and `/assets/qr` return binary bytes without base64 encoding. History carries public media checksums for echo correlation; native raw records stay inside this service.
+The typed tRPC API at `/trpc` exposes status, contacts, groups, conversations, resumable history, recent messages, a bounded long-poll change journal, revocations, login and logout, text sends, and multipart image/file uploads. Reads are scoped to the current account, including its retained database shards; databases from a previous account are excluded. Authenticated `/assets/avatar`, `/assets/media`, `/assets/thumbnail`, and `/assets/qr` return binary bytes without base64 encoding. History carries public media checksums for echo correlation; native raw records stay inside this service.
 
 Group responses include `joined` when the cached native roster and account contact are available. System XML is normalized into readable message text and a `system.type` such as `payment_reminder`; native XML and payment action URLs are not part of the public response.
 
@@ -64,3 +66,5 @@ bun packages/wechat-runtime/scripts/adb-login.ts --watch
 ```
 
 The watcher checks the local API for a pending phone confirmation, matches WeChat's desktop login prompt through Android UI automation, and presses its login button. When WeChat hides accessibility controls, it checks the exact desktop-login activity and locates the large green button from an in-memory screenshot. It waits when the phone is locked. Use `ANDROID_SERIAL` when multiple ADB devices are connected. Omit `--watch` for one check; Ctrl+C stops the watcher. UI dumps are temporary files on the phone and are deleted after each check; account and conversation text are not logged.
+
+Schema metadata is cached by database identity and SQLite schema version. Committed write hints coalesce affected tables; uncertain SQL or triggers widen the scan. Full snapshots run at least once a minute, and failed scans retain their previous snapshot. Pending media uses bounded filesystem watchers as hints; only message-bound checksum verification emits availability. The bridge and runtime must be deployed at matching versions.

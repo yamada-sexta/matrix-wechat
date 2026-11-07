@@ -68,6 +68,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS incoming(key TEXT PRIMARY KEY,account TEXT NOT NULL,chat TEXT NOT NULL,payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS revocations(account TEXT NOT NULL,chat TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(account,chat,id));
       CREATE TABLE IF NOT EXISTS uploads(key TEXT PRIMARY KEY,mxc TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS dirty_chats(account TEXT NOT NULL,chat TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(account,chat));
       PRAGMA user_version=1;
     `);
     // A native operation may have happened before the process stopped. Never resend it.
@@ -104,6 +105,29 @@ export class Store {
   }
   portal(account: string, chat: string) {
     return this.get<Portal>("SELECT * FROM portals WHERE account=? AND chat=?", account, chat);
+  }
+  dirtyChat(account: string, chat: string) {
+    this.run(
+      "INSERT INTO dirty_chats VALUES(?,?,1) ON CONFLICT(account,chat) DO UPDATE SET revision=revision+1",
+      account,
+      chat,
+    );
+  }
+  dirtyChats(account: string) {
+    return this.all<{ chat: string; revision: number }>(
+      "SELECT chat,revision FROM dirty_chats WHERE account=?",
+      account,
+    );
+  }
+  cleanChat(account: string, chat: string, revision: number) {
+    this.run(
+      "DELETE FROM dirty_chats WHERE account=? AND chat=? AND revision=? AND NOT EXISTS(SELECT 1 FROM incoming WHERE account=? AND chat=?)",
+      account,
+      chat,
+      revision,
+      account,
+      chat,
+    );
   }
   portalForRoom(room: string) {
     return this.get<Portal>("SELECT * FROM portals WHERE room=?", room);
@@ -199,6 +223,7 @@ export class Store {
       message.chat_id,
       JSON.stringify(publicFields(message)),
     );
+    this.dirtyChat(message.account_id, message.chat_id);
   }
   close() {
     this.db.close();

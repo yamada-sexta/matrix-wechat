@@ -1,4 +1,11 @@
-import { APIError, errorCode, imageType, type Status, type WeChatClient } from "wechat-rpc";
+import {
+  APIError,
+  type ChangeBatch,
+  errorCode,
+  imageType,
+  type Status,
+  type WeChatClient,
+} from "wechat-rpc";
 import type { Config } from "./config";
 import { ghostID, incoming, messageFingerprint, outgoing } from "./convert";
 import type { Matrix } from "./matrix";
@@ -30,6 +37,11 @@ export class WeChatBridge {
   private groups = new Map<string, Group>();
   private joined = new Set<string>();
   private rotation = 0;
+  private changeAbort = new AbortController();
+  private changeLoop?: Promise<void>;
+  private lastRecovery = 0;
+  private metadataDirty = false;
+  private revocationsDirty = true;
   lastError = "";
   constructor(
     readonly config: Config,
@@ -91,13 +103,84 @@ export class WeChatBridge {
     await this.matrix.joinOwner(this.management);
     for (const portal of this.store.all<{ room: string }>("SELECT room FROM portals"))
       await this.matrix.joinOwner(portal.room);
+    this.changeLoop = this.watchChanges();
     await this.tick();
     this.timer = setInterval(() => void this.tick(), 1000);
   }
   async stop() {
     this.stopped = true;
+    this.changeAbort.abort();
     if (this.timer) clearInterval(this.timer);
     while (this.busy) await Bun.sleep(25);
+    await this.changeLoop;
+  }
+  private applyChanges(batch: ChangeBatch) {
+    this.store.db.transaction(() => {
+      if (batch.reset) this.store.setMeta("change_recovery_needed", "true");
+      for (const event of batch.events) {
+        const account = event.account_id;
+        if (event.type === "login.state" || event.type === "connection.closed")
+          this.store.setMeta("change_recovery_needed", "true");
+        if (event.type === "metadata.updated") this.metadataDirty = true;
+        if (event.type === "revocations.updated") this.revocationsDirty = true;
+        if (account && event.chat_id) {
+          this.store.dirtyChat(account, event.chat_id);
+          if (event.message) this.store.queue(event.message);
+          if (event.type === "message.revoked" && event.data?.message_id)
+            this.store.run(
+              "INSERT OR IGNORE INTO revocations VALUES(?,?,?)",
+              account,
+              event.chat_id,
+              String(event.data.message_id),
+            );
+          if (event.type === "media.available" && event.data?.message_id) {
+            const mapping = this.store.mapping(
+              account,
+              event.chat_id,
+              String(event.data.message_id),
+            );
+            if (mapping) {
+              this.store.setMeta(`media_due:${mapping.event}`, "0");
+              this.store.setMeta(`media_attempt:${mapping.event}`, "0");
+              this.store.setMeta(
+                `media_wake:${mapping.event}`,
+                String((Number(this.store.meta(`media_wake:${mapping.event}`)) || 0) + 1),
+              );
+            }
+          }
+        }
+      }
+      this.store.setMeta(
+        "change_cursor",
+        JSON.stringify({ epoch: batch.epoch, cursor: batch.cursor }),
+      );
+    })();
+  }
+  private async watchChanges() {
+    while (!this.stopped) {
+      try {
+        let cursor: { epoch?: string; cursor?: number } = {};
+        try {
+          const saved = JSON.parse(this.store.meta("change_cursor") || "{}");
+          if (
+            typeof saved.epoch === "string" &&
+            Number.isSafeInteger(saved.cursor) &&
+            saved.cursor >= 0
+          )
+            cursor = saved;
+        } catch {}
+        const batch = await this.runtime.rpc.changes.query(
+          { ...cursor, wait_ms: 25000 },
+          { signal: this.changeAbort.signal },
+        );
+        if (this.stopped) break;
+        this.applyChanges(batch);
+      } catch {
+        if (this.stopped || this.changeAbort.signal.aborted) break;
+        this.lastError = "change_feed_unavailable";
+        await Bun.sleep(1000);
+      }
+    }
   }
   async notice(room: string, text: string, key: string) {
     await this.matrix.send(
@@ -139,6 +222,7 @@ export class WeChatBridge {
       this.contacts.clear();
       this.groups.clear();
       this.joined.clear();
+      this.store.setMeta("change_recovery_needed", "true");
     }
     const state = this.connection.state;
     await this.portalPermissions();
@@ -516,6 +600,12 @@ export class WeChatBridge {
     );
     this.store.setMeta(`message_type:${edit ? existing.event : event}`, converted.type);
     this.store.setMeta(`media_preview:${edit ? existing.event : event}`, String(converted.preview));
+    if (!converted.missingMedia)
+      this.store.run(
+        "DELETE FROM meta WHERE key IN (?,?)",
+        `media_due:${edit ? existing.event : event}`,
+        `media_attempt:${edit ? existing.event : event}`,
+      );
     return true;
   }
   private async confirmPending(chat: string, recent: Message[]) {
@@ -588,12 +678,21 @@ export class WeChatBridge {
         portal.chat,
       )) {
         if (await this.receive(JSON.parse(row.payload), portal))
-          this.store.run("DELETE FROM incoming WHERE key=?", row.key);
+          this.store.run("DELETE FROM incoming WHERE key=? AND payload=?", row.key, row.payload);
       }
     }
   }
   private async redactions() {
-    for (const revoke of await this.runtime.rpc.revocations.query())
+    const refreshed = this.revocationsDirty;
+    this.revocationsDirty = false;
+    let revokes: { chat: string; id: string }[] = [];
+    try {
+      if (refreshed) revokes = await this.runtime.rpc.revocations.query();
+    } catch (error) {
+      this.revocationsDirty = true;
+      throw error;
+    }
+    for (const revoke of revokes)
       this.store.run(
         "INSERT OR IGNORE INTO revocations VALUES(?,?,?)",
         this.account,
@@ -630,12 +729,33 @@ export class WeChatBridge {
     for (const row of rows) {
       // Advance even when this attachment is unavailable or an individual read fails.
       this.store.setMeta(cursorKey, String(row.retry_rowid));
+      if (Number(this.store.meta(`media_due:${row.event}`)) > Date.now()) continue;
+      const wake = this.store.meta(`media_wake:${row.event}`);
       try {
         const portal = this.store.portal(this.account, row.chat);
         if (portal) await this.receive(JSON.parse(row.payload), portal);
       } catch (error) {
         this.lastError = errorCode(error) || "media_retry_failed";
         console.error("Bridge media retry:", this.lastError);
+      } finally {
+        const current = this.store.mapping(this.account, row.chat, row.id, row.local || undefined);
+        if (current?.media_retry) {
+          if (wake === this.store.meta(`media_wake:${row.event}`)) {
+            const attempt = Math.min(
+              20,
+              (Number(this.store.meta(`media_attempt:${row.event}`)) || 0) + 1,
+            );
+            this.store.setMeta(`media_attempt:${row.event}`, String(attempt));
+            this.store.setMeta(
+              `media_due:${row.event}`,
+              String(Date.now() + Math.min(300000, 5000 * 2 ** (attempt - 1))),
+            );
+          }
+        } else {
+          this.store.setMeta(`media_attempt:${row.event}`, "");
+          this.store.setMeta(`media_due:${row.event}`, "");
+          this.store.setMeta(`media_wake:${row.event}`, "");
+        }
       }
     }
     if (rows.length < 10) this.store.setMeta(cursorKey, "0");
@@ -872,10 +992,15 @@ export class WeChatBridge {
       await this.status();
       await this.jobs();
       if (this.connection.state === "logged_in") {
-        if (Date.now() - this.lastMetadata >= 60000) await this.metadata();
-        else
-          for (const conversation of await this.conversationsList())
-            await this.ensurePortal(conversation.id, conversation.name);
+        if (this.metadataDirty || Date.now() - this.lastMetadata >= 60000) {
+          this.metadataDirty = false;
+          try {
+            await this.metadata();
+          } catch (error) {
+            this.metadataDirty = true;
+            throw error;
+          }
+        }
       }
       await this.jobs();
       if (this.connection.state !== "logged_in") return;
@@ -885,12 +1010,39 @@ export class WeChatBridge {
       ))
         await this.ensurePortal(row.chat);
       const portals = this.store.portals(this.account);
+      const recovering = this.store.meta("change_recovery_needed") === "true";
+      if (recovering || Date.now() - this.lastRecovery >= 60000) {
+        this.store.db.transaction(() => {
+          for (const portal of portals) {
+            this.store.dirtyChat(this.account, portal.chat);
+            if (recovering) {
+              this.store.run(
+                "UPDATE portals SET cursor=NULL,imported=0 WHERE account=? AND chat=?",
+                this.account,
+                portal.chat,
+              );
+              portal.cursor = null;
+              portal.imported = 0;
+            }
+          }
+          if (recovering) this.store.setMeta("change_recovery_needed", "");
+        })();
+        this.lastRecovery = Date.now();
+        this.revocationsDirty = true;
+      }
+      const dirty = new Map(
+        this.store.dirtyChats(this.account).map((row) => [row.chat, row.revision]),
+      );
+      const pending = new Set(this.store.pending(this.account).map((row) => row.chat));
       const start = this.rotation++ % Math.max(portals.length, 1);
       for (let index = 0; index < portals.length; index++) {
         if (this.stopped) break;
         const portal = portals[(start + index) % portals.length];
+        if (portal.imported && !dirty.has(portal.chat) && !pending.has(portal.chat)) continue;
         try {
           await this.reconcile(portal);
+          if (dirty.has(portal.chat))
+            this.store.cleanChat(this.account, portal.chat, dirty.get(portal.chat)!);
         } catch (error) {
           this.lastError = errorCode(error) || "reconciliation_failed";
           console.error("Bridge reconciliation:", this.lastError);

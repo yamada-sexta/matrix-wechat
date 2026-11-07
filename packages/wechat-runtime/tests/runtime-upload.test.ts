@@ -5,18 +5,14 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PNG } from "pngjs";
+import { Runtime } from "../src/runtime";
 import type { Message } from "../src/types";
 
 const directory = await mkdtemp(join(tmpdir(), "wechat-outbound-test-"));
-const previous = process.env.WECHAT_DATA_DIR;
-process.env.WECHAT_DATA_DIR = directory;
-const { Runtime } = await import("../src/runtime");
-if (previous === undefined) delete process.env.WECHAT_DATA_DIR;
-else process.env.WECHAT_DATA_DIR = previous;
 afterAll(() => rm(directory, { recursive: true, force: true }));
 
 test("image queue acknowledgement retains upload sources until server confirmation", async () => {
-  const runtime = new Runtime();
+  const runtime = new Runtime(directory);
   runtime.status = { state: "logged_in" };
   Object.assign(runtime, { sendReady: true });
   runtime.store.databases = async () => [

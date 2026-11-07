@@ -41,6 +41,17 @@ function months(message: Message) {
       .slice(0, 7),
   );
 }
+export function attachmentWatchDirectories(message: Message, home = "/home/wechat") {
+  const root = accountDirectory(message, home);
+  const directories = months(message).map((month) =>
+    message.kind === "image"
+      ? join(root, "msg/attach", md5(message.chat_id), month, "Img")
+      : message.kind === "video"
+        ? join(root, "msg/video", month)
+        : join(root, "msg/file", month),
+  );
+  return { root, directories };
+}
 export async function receivedThumbnail(message: Message, home = "/home/wechat") {
   const checksum = String(metadata(message).appmsg?.appattach?.cdnthumbmd5 || "").toLowerCase();
   if (!/^[a-f0-9]{32}$/.test(checksum))

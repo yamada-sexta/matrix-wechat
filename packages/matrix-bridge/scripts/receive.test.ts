@@ -165,6 +165,19 @@ test("missing images upgrade to labeled previews and then originals without repe
   await restarted["retryMedia"]();
   expect(f.sends).toHaveLength(2);
   originalAvailable = true;
+  restarted["applyChanges"]({
+    epoch: "test",
+    cursor: 1,
+    reset: false,
+    events: [
+      {
+        type: "media.available",
+        account_id: "self",
+        chat_id: "contact",
+        data: { message_id: "1" },
+      },
+    ],
+  });
   await restarted["retryMedia"]();
   expect(f.sends).toHaveLength(3);
   expect(f.sends[2][3]).toMatchObject({
@@ -226,6 +239,85 @@ test("media retries rotate past old failures, survive restart, and isolate indiv
   restarted["receive"] = receive;
   await restarted["retryMedia"]();
   expect(attempted.slice(10)).toEqual(["11", "12", "13"]);
+  expect(Number(f.store.meta("media_due:$old2"))).toBeGreaterThan(Date.now());
+  // Persisted retry deadlines eventually pass; entries are never abandoned.
+  f.store.run("UPDATE meta SET value='0' WHERE key LIKE 'media_due:%'");
   await restarted["retryMedia"]();
   expect(attempted.slice(13)).toEqual(Array.from({ length: 10 }, (_, i) => String(i + 1)));
+});
+
+test("a queued old-row edit arriving during delivery survives and dirty work stays durable", async () => {
+  const f = await fixture();
+  f.bridge.runtime.rpc = {
+    recent: { query: async () => [] },
+    history: { query: async () => ({ messages: [], cursor: "end", done: true }) },
+  } as unknown as WeChatBridge["runtime"]["rpc"];
+  f.store.queue(f.message);
+  f.store.dirtyChat("self", "contact");
+  const revision = f.store.dirtyChats("self")[0].revision;
+  f.bridge["receive"] = async () => {
+    f.bridge["applyChanges"]({
+      epoch: "epoch",
+      cursor: 2,
+      reset: false,
+      events: [
+        {
+          type: "message.updated",
+          account_id: "self",
+          chat_id: "contact",
+          message: { ...f.message, text: "new edit" },
+        },
+      ],
+    });
+    return true;
+  };
+  await f.bridge["reconcile"](f.portal);
+  f.store.cleanChat("self", "contact", revision);
+  expect(
+    f.store
+      .all<{ payload: string }>("SELECT payload FROM incoming")
+      .map((row) => JSON.parse(row.payload).text),
+  ).toEqual(["new edit"]);
+  expect(f.store.dirtyChats("self")).toHaveLength(1);
+  expect(JSON.parse(f.store.meta("change_cursor")!)).toEqual({ epoch: "epoch", cursor: 2 });
+  const current = f.store.dirtyChats("self")[0].revision;
+  f.store.cleanChat("self", "contact", current);
+  expect(f.store.dirtyChats("self")).toHaveLength(1); // backlog also prevents cleaning current revision
+});
+
+test("idle imported conversations avoid history reads; journal gaps replay history and retain queued pages", async () => {
+  const f = await fixture();
+  f.store.progress("self", "contact", "old-end", true);
+  f.bridge["lastMetadata"] = f.bridge["lastRecovery"] = f.bridge["lastMediaRetry"] = Date.now();
+  f.bridge["revocationsDirty"] = false;
+  let historyReads = 0,
+    recentReads = 0;
+  const cursors: unknown[] = [];
+  f.bridge["status"] = async () => false;
+  f.bridge.runtime.rpc = {
+    recent: {
+      query: async () => {
+        recentReads++;
+        return [];
+      },
+    },
+    history: {
+      query: async (input: { cursor?: string }) => {
+        historyReads++;
+        cursors.push(input.cursor);
+        return { messages: [], cursor: "next", done: false };
+      },
+    },
+  } as unknown as WeChatBridge["runtime"]["rpc"];
+  await f.bridge.tick();
+  expect([recentReads, historyReads]).toEqual([0, 0]);
+  f.bridge["applyChanges"]({ epoch: "new-epoch", cursor: 0, reset: true, events: [] });
+  f.bridge.runtime.rpc.revocations = {
+    query: async () => [],
+  } as unknown as WeChatBridge["runtime"]["rpc"]["revocations"];
+  await f.bridge.tick();
+  expect(cursors).toEqual([undefined]);
+  expect(f.store.portal("self", "contact")?.imported).toBe(0);
+  await f.bridge.tick();
+  expect(cursors).toEqual([undefined, "next"]);
 });

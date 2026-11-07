@@ -3,6 +3,8 @@ import { z } from "zod";
 import { loginRequestSchema, textMessageSchema } from "./schemas";
 import {
   APIError,
+  type ChangeBatch,
+  type ChangeCursor,
   type Contact,
   type Conversation,
   type Group,
@@ -11,6 +13,7 @@ import {
 } from "./types";
 
 export interface Backend {
+  changes(input: ChangeCursor): Promise<ChangeBatch>;
   status(): { status: Status; qrAt: number; qrAvailable: boolean };
   contacts(): Promise<Contact[]>;
   groups(): Promise<Group[]>;
@@ -47,6 +50,15 @@ const t = initTRPC.context<Backend>().create({
 });
 const chat = z.string().min(1);
 export const router = t.router({
+  changes: t.procedure
+    .input(
+      z.object({
+        epoch: z.string().max(64).optional(),
+        cursor: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+        wait_ms: z.number().int().min(0).max(25000).default(25000),
+      }),
+    )
+    .query(({ ctx, input }) => ctx.changes(input)),
   status: t.procedure.query(({ ctx }) => ctx.status()),
   contacts: t.procedure.query(({ ctx }) => ctx.contacts()),
   groups: t.procedure.query(({ ctx }) => ctx.groups()),

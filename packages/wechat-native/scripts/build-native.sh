@@ -23,3 +23,15 @@ if nm -D --undefined-only "$output_dir/download.so" | grep -E '__cxa_(begin_catc
   echo 'Native exception forwarders did not bind locally' >&2
   exit 1
 fi
+# Keep the validated downloader's compiler/linker inputs unchanged.
+"$compiler" "${flags[@]}" -shared -fPIC \
+  "$native_root/native/query.cc" "$native_root/native/download-eh.S" \
+  -Wl,-Bsymbolic,--no-undefined -lgcc_s -lc -lm -o "$output_dir/query.so"
+"$compiler" -std=c++17 -O2 -Wall -Wextra -Werror \
+  "$native_root/tests/query.cc" -lsqlite3 -ldl -o "$output_dir/query-test"
+"$output_dir/query-test" "$output_dir/query.so" "$output_dir/query-doubles.bin" > "$output_dir/query-results.jsonl"
+bun "$native_root/../wechat-runtime/scripts/verify-native-query.ts" "$output_dir/query-results.jsonl" "$output_dir/query-doubles.bin"
+if nm -D --undefined-only "$output_dir/query.so" | grep -E '__cxa_(begin_catch|end_catch|throw|allocate_exception)|__gxx_personality|_Unwind_Resume'; then
+  echo 'Query exception forwarders did not bind locally' >&2
+  exit 1
+fi

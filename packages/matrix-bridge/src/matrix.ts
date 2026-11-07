@@ -80,6 +80,29 @@ export class Matrix {
         throw new Error("Matrix owner token does not match bridge.owner");
     }
     await this.sdk.run(this.config.appservice.port, undefined, this.config.appservice.hostname);
+    try {
+      await this.ensureBotAvatar();
+    } catch {
+      console.warn("Default WeChat bot avatar could not be set; bridging will continue");
+    }
+  }
+  private async ensureBotAvatar() {
+    const intent = this.sdk.getIntent();
+    // Bridge.run assumes its sender is registered. Explicitly register it before
+    // setting a profile: appservice authentication alone can use a virtual sender.
+    await intent.ensureRegistered(true);
+    let profile: { avatar_url?: string } = {};
+    try {
+      profile = await intent.matrixClient.getUserProfile(this.bot);
+    } catch (error: any) {
+      if (error.errcode !== "M_NOT_FOUND") throw error;
+    }
+    if (profile.avatar_url) return;
+    const bytes = Buffer.from(
+      await Bun.file(new URL("../assets/wechat.png", import.meta.url)).arrayBuffer(),
+    );
+    const avatar = await this.upload({ bytes, type: "image/png", name: "wechat.png" });
+    await intent.setAvatarUrl(avatar);
   }
   async joinOwner(room: string) {
     if (!this.ownerClient || this.ownerJoined.has(room)) return room;

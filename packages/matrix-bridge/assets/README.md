@@ -1,0 +1,1 @@
+`wechat.png` is the WeChat icon linked as the Apple touch icon by the official Linux download page, fetched from https://res.wx.qq.com/a/wx_fed/assets/res/OTE0YTAw.png. It supplies the default Matrix bot avatar when no avatar is set.

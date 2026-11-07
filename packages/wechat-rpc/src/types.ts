@@ -56,6 +56,17 @@ export interface Event {
   message?: Message;
   data?: Row;
 }
+export interface ChangeCursor {
+  epoch?: string;
+  cursor?: number;
+  wait_ms?: number;
+}
+export interface ChangeBatch {
+  epoch: string;
+  cursor: number;
+  reset: boolean;
+  events: Event[];
+}
 export interface Status {
   state:
     | "starting"

@@ -25,6 +25,7 @@ WORKDIR /opt/matrix-wechat
 COPY --from=dependencies /opt/matrix-wechat /opt/matrix-wechat
 COPY --from=build /opt/matrix-wechat/packages/wechat-rpc/src ./packages/wechat-rpc/src
 COPY --from=build /opt/matrix-wechat/packages/matrix-bridge/src ./packages/matrix-bridge/src
+COPY --from=build /opt/matrix-wechat/packages/matrix-bridge/assets ./packages/matrix-bridge/assets
 COPY example-config.yaml ./example-config.yaml
 RUN mkdir -p /data && chown bun:bun /data && chmod 0700 /data
 USER bun

@@ -6,4 +6,5 @@ declare global {
   const OUTBOUND: OutboundProfile;
   const SESSION: SessionProfile;
   const DOWNLOAD_ADAPTER: string;
+  const QUERY_ADAPTER: string;
 }

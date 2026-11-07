@@ -1,4 +1,6 @@
+import { CommittedWrites, transactionEnd, type WriteScope, writeScope } from "./changes";
 import { createDownloader } from "./download";
+import { createQueryBatch } from "./query";
 import { createSession } from "./session";
 import { createUploadHooks } from "./uploads";
 
@@ -7,6 +9,7 @@ import { createUploadHooks } from "./uploads";
 const base = Process.mainModule.base;
 const nullPtr = ptr(0);
 const imageDownloads = createDownloader();
+const queryBatch = createQueryBatch();
 interface DatabaseConnection {
   id: string;
   db: NativePointer;
@@ -23,6 +26,7 @@ interface PreparedStatement {
   write: boolean;
   cipher: string | null;
   transactionEnd: boolean;
+  scope: WriteScope;
 }
 type OpenInvocation = InvocationContext & { output?: NativePointer; path?: string };
 type PrepareInvocation = InvocationContext & {
@@ -30,6 +34,7 @@ type PrepareInvocation = InvocationContext & {
   output?: NativePointer;
   cipher?: string | null;
   transactionEnd?: boolean;
+  scope?: WriteScope;
 };
 type StepInvocation = InvocationContext & { statement?: PreparedStatement };
 type CloseInvocation = InvocationContext & { dbId?: string; connection?: DatabaseConnection };
@@ -70,7 +75,6 @@ type SendTrace =
       callers: string[];
     }
   | { error: string };
-type DatabaseValue = string | number | null | { bytes: number[] };
 
 const connections = new Map<string, DatabaseConnection>(),
   retained = new Map<string, DatabaseConnection>(),
@@ -166,6 +170,9 @@ function hint(kind: string, data: Record<string, unknown>) {
   revision++;
   send({ type: "change_hint", kind, revision, ...data });
 }
+const committedWrites = new CommittedWrites((change) =>
+  hint("committed_write", change as unknown as Record<string, unknown>),
+);
 function recognized(path: string) {
   return (
     /\/db_storage\//.test(path) &&
@@ -266,7 +273,8 @@ for (const name of ["prepare_v2", "prepare_v3"])
             p.sub(base).toString(),
           ),
         });
-      this.transactionEnd = /^\s*(COMMIT|END|ROLLBACK)\b/i.test(sql);
+      this.transactionEnd = transactionEnd(sql);
+      this.scope = writeScope(sql);
       this.cipher = sql.match(
         /^\s*PRAGMA\s+(cipher_[a-z_]+|kdf_iter|fast_kdf_iter)\s*=\s*([a-zA-Z0-9_'"-]+)\s*;?\s*$/i,
       )
@@ -284,6 +292,7 @@ for (const name of ["prepare_v2", "prepare_v3"])
           write: !native.stmt_readonly(statement),
           cipher: this.cipher ?? null,
           transactionEnd: this.transactionEnd === true,
+          scope: this.scope || {},
         });
       }
     },
@@ -306,10 +315,9 @@ Interceptor.attach(base.add(PROFILE.functions.step), {
       try {
         committed = native.get_autocommit(s.connection.db) !== 0;
       } catch (_) {}
-      hint(committed ? "committed_write" : "transaction_write", {
-        id: s.connection.id,
-        path: s.connection.path,
-      });
+      if (s.write && !s.transactionEnd)
+        committedWrites.record(s.connection.id, s.connection.path, s.scope);
+      if (committed) committedWrites.commit(s.connection.id);
     }
   },
 });
@@ -335,6 +343,7 @@ for (const name of ["close", "close_v2"])
         }
         retained.set(this.connection.path, this.connection);
         connections.delete(this.dbId);
+        committedWrites.forget(this.connection.id);
         hint("database_closed", { id: this.connection.id, path: this.connection.path });
       }
     },
@@ -359,68 +368,7 @@ function accountMatches(account: string) {
   return accounts.size === 1 && accounts.has(account);
 }
 function sqlQuery(db: NativePointer, sql: string, maxRows: number, allowWrite = false) {
-  const holder = Memory.alloc(Process.pointerSize);
-  holder.writePointer(nullPtr);
-  const tail = Memory.alloc(Process.pointerSize);
-  let statement = nullPtr;
-  // SQLite's tail points into this buffer; retain it until tail validation.
-  const sqlBuffer = Memory.allocUtf8String(sql);
-  const rc = native.prepare_v2(db, sqlBuffer, -1, holder, tail);
-  if (rc !== 0) throw Error("SQLite prepare " + rc + ": " + text(native.errmsg(db)));
-  statement = holder.readPointer();
-  if (statement.isNull()) throw Error("Empty SQL statement");
-  try {
-    const remainder = tail.readPointer();
-    if (
-      remainder.isNull() ||
-      remainder.compare(sqlBuffer) < 0 ||
-      remainder.compare(sqlBuffer.add(unescape(encodeURIComponent(sql)).length)) > 0
-    )
-      throw Error("Invalid SQL tail");
-    if (text(remainder).trim()) throw Error("Only one SQL statement allowed");
-    if (!allowWrite && !native.stmt_readonly(statement)) throw Error("Query is not read-only");
-    const count = native.column_count(statement),
-      columns: string[] = [],
-      rows: DatabaseValue[][] = [];
-    let truncated = false;
-    for (let i = 0; i < count; i++) columns.push(text(native.column_name(statement, i)));
-    while (true) {
-      const status = native.step(statement);
-      if (status === 101) break;
-      if (status !== 100) throw Error("SQLite step " + status + ": " + text(native.errmsg(db)));
-      if (rows.length >= maxRows) {
-        truncated = true;
-        break;
-      }
-      const row: DatabaseValue[] = [];
-      for (let i = 0; i < count; i++) {
-        const type = native.column_type(statement, i);
-        if (type === 1) row.push(native.column_int64(statement, i).toString());
-        else if (type === 2) row.push(native.column_double(statement, i));
-        else if (type === 3) {
-          const p = native.column_text(statement, i),
-            n = native.column_bytes(statement, i);
-          if (n > 8 * 1024 * 1024) throw Error("Text exceeds read limit");
-          try {
-            row.push(n ? p.readUtf8String(n) : "");
-          } catch (_) {
-            row.push({ bytes: Array.from(new Uint8Array(readBytes(p, n))) });
-          }
-        } else if (type === 4) {
-          const n = native.column_bytes(statement, i);
-          if (n > 8 * 1024 * 1024) throw Error("Blob exceeds read limit");
-          const p = native.column_blob(statement, i);
-          row.push({
-            bytes: Array.from(new Uint8Array(n ? readBytes(p, n) : new ArrayBuffer(0))),
-          });
-        } else row.push(null);
-      }
-      rows.push(row);
-    }
-    return { columns, rows, truncated };
-  } finally {
-    native.finalize(statement);
-  }
+  return queryBatch.query(db, sql, maxRows, allowWrite);
 }
 function reader(c: DatabaseConnection): NativePointer {
   if (c.reader) return c.reader;
@@ -1009,6 +957,7 @@ rpc.exports = {
       download_generation: imageDownloads.generation(),
       revision,
       databases: connections.size,
+      query_batch: queryBatch.stats(),
     };
   },
   scanqr: scanQR,

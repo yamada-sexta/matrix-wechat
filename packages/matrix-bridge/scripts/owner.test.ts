@@ -90,3 +90,46 @@ test("double-puppeted sends use the owner identity, preserve timestamps, and mar
     "fi.mau.double_puppet_source": "matrix-wechat",
   });
 });
+
+test("startup registers the bot and sets its bundled avatar when the profile is missing", async () => {
+  const matrix = await fixture("");
+  spyOn(matrix.sdk, "run").mockResolvedValue(undefined);
+  const registered = mock(async () => "registered=true");
+  const avatar = mock(async (_url: string) => undefined);
+  const upload = spyOn(matrix, "upload").mockResolvedValue("mxc://example.com/wechat");
+  spyOn(matrix.sdk, "getIntent").mockReturnValue({
+    ensureRegistered: registered,
+    matrixClient: {
+      getUserProfile: async () => {
+        throw { errcode: "M_NOT_FOUND" };
+      },
+    },
+    setAvatarUrl: avatar,
+  } as unknown as ReturnType<Matrix["sdk"]["getIntent"]>);
+  await matrix.start();
+  expect(registered).toHaveBeenCalledWith(true);
+  expect(upload.mock.calls[0][0].type).toBe("image/png");
+  expect(upload.mock.calls[0][0].bytes.subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
+  expect(avatar).toHaveBeenCalledWith("mxc://example.com/wechat");
+});
+
+test("startup preserves a custom bot avatar and stays available after profile failures", async () => {
+  const matrix = await fixture("");
+  spyOn(matrix.sdk, "run").mockResolvedValue(undefined);
+  const upload = spyOn(matrix, "upload");
+  let broken = false;
+  spyOn(matrix.sdk, "getIntent").mockReturnValue({
+    ensureRegistered: async () => "registered=true",
+    matrixClient: {
+      getUserProfile: async () => {
+        if (broken) throw { errcode: "M_UNKNOWN" };
+        return { avatar_url: "mxc://example.com/custom" };
+      },
+    },
+  } as unknown as ReturnType<Matrix["sdk"]["getIntent"]>);
+  await matrix.start();
+  broken = true;
+  spyOn(console, "warn").mockImplementation(() => {});
+  await matrix.start();
+  expect(upload).not.toHaveBeenCalled();
+});

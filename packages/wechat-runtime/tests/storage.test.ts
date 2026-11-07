@@ -5,6 +5,7 @@ import { Storage } from "../src/storage";
 import type { Database, NativeDB } from "../src/types";
 
 class Fixture implements NativeDB {
+  queries: { id: string; sql: string }[] = [];
   connections = new Map<string, SQLite>();
   visible: Database[] = [];
   truncated = false;
@@ -24,6 +25,7 @@ class Fixture implements NativeDB {
     return this.visible;
   }
   async query(id: string, sql: string, limit: number) {
+    this.queries.push({ id, sql });
     sql = sql
       .replaceAll("wcdb_decompress(message_content,WCDB_CT_message_content)", "message_content")
       .replaceAll("wcdb_decompress(source,WCDB_CT_source)", "source");
@@ -278,4 +280,68 @@ test("bridge keyset history crosses 50,000 rows and resumes equal timestamps acr
   });
   native.truncated = true;
   await expect(store.bridgeHistory(chat)).rejects.toMatchObject({ code: "scan_limit" });
+});
+
+test("schema cache survives message writes and discovers DDL in an open database", async () => {
+  const { native, store, db, insert } = setup();
+  const source = native.visible[0];
+  const first = await store.tables(source);
+  native.queries.length = 0;
+  insert(1, 101n);
+  expect(await store.tables(source)).toBe(first);
+  expect(native.queries.map((q) => q.sql)).toEqual(["PRAGMA schema_version"]);
+  db.run("CREATE TABLE newly_created(value TEXT)");
+  expect((await store.tables(source)).has("newly_created")).toBe(true);
+});
+
+test("dirty-table snapshots preserve old edits, ID promotion, deletion and untouched conversations", async () => {
+  const { native, store, db, table, insert } = setup();
+  const other = "Msg_" + createHash("md5").update("other_friend").digest("hex");
+  db.run("INSERT INTO Name2Id VALUES('other_friend',1)");
+  db.run(`CREATE TABLE ${other} AS SELECT * FROM ${table}`);
+  insert(1, 0n, "pending");
+  insert(2, 102n, "deleted");
+  db.run(`INSERT INTO ${other} VALUES(1,201,1,2,100,'untouched',0)`);
+  await store.changes();
+  db.run(`UPDATE ${table} SET server_id=101,message_content='edited' WHERE local_id=1`);
+  db.run(`DELETE FROM ${table} WHERE local_id=2`);
+  native.queries.length = 0;
+  const events = await store.changes(
+    new Map([[native.visible[0].path, new Set([table.toLowerCase()])]]),
+  );
+  expect(
+    events.some(
+      (e) =>
+        e.type === "message.updated" &&
+        e.message?.id === "101" &&
+        e.message.text === "edited" &&
+        e.data?.previous_id?.startsWith("local:"),
+    ),
+  ).toBe(true);
+  expect(events.some((e) => e.type === "message.deleted" && e.data?.message_id === "102")).toBe(
+    true,
+  );
+  expect(events.some((e) => e.chat_id === "other_friend")).toBe(false);
+  expect(native.queries.some((q) => q.sql.includes(`FROM "${other}" WHERE local_id`))).toBe(false);
+  db.run(`UPDATE ${other} SET message_content='recovered'`);
+  expect((await store.changes()).some((e) => e.message?.text === "recovered")).toBe(true);
+});
+
+test("trigger writes widen dirty snapshots and failed partial scans preserve the previous snapshot", async () => {
+  const { native, store, db, table, insert } = setup();
+  const other = "Msg_" + createHash("md5").update("other_friend").digest("hex");
+  db.run("INSERT INTO Name2Id VALUES('other_friend',1)");
+  db.run(`CREATE TABLE ${other} AS SELECT * FROM ${table}`);
+  db.run(
+    `CREATE TRIGGER mirror AFTER INSERT ON ${table} BEGIN INSERT INTO ${other} SELECT * FROM ${table} WHERE local_id=new.local_id; END`,
+  );
+  await store.changes();
+  insert(1, 101n);
+  const scope = new Map([[native.visible[0].path, new Set([table.toLowerCase()])]]);
+  native.truncated = true;
+  await expect(store.changes(scope)).rejects.toMatchObject({ code: "scan_limit" });
+  native.truncated = false;
+  const events = await store.changes(scope);
+  expect(events.filter((e) => e.type === "message")).toHaveLength(2);
+  expect(await store.changes(scope)).toEqual([]);
 });
