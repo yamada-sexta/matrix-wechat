@@ -321,3 +321,85 @@ test("idle imported conversations avoid history reads; journal gaps replay histo
   await f.bridge.tick();
   expect(cursors).toEqual([undefined, "next"]);
 });
+
+async function confirmationFixture(state: string, notice: number, age: number) {
+  const f = await fixture();
+  f.bridge.matrix.joinOwner = async (room) => room;
+  f.store.progress("self", "contact", "end", true);
+  f.bridge["lastMetadata"] = f.bridge["lastRecovery"] = f.bridge["lastMediaRetry"] = Date.now();
+  f.bridge["revocationsDirty"] = false;
+  f.bridge["status"] = async () => false;
+  const started = Date.now() - age;
+  const source: Message = { ...f.message, timestamp: started / 1000 + 1 };
+  const event: MatrixEvent = {
+    event_id: "$pending",
+    room_id: f.portal.room,
+    sender: f.config.bridge.owner,
+    type: "m.room.message",
+    content: { msgtype: "m.text", body: source.text },
+  };
+  f.store.accept(event);
+  f.store.run(
+    "UPDATE inbox SET account='self',chat='contact',state=?,notice=?,started=?,fingerprint=? WHERE id=?",
+    state,
+    notice,
+    started,
+    JSON.stringify(["text", source.text, ""]),
+    event.event_id,
+  );
+  let reads = 0;
+  const recent: Message[] = [];
+  f.bridge.runtime.rpc = {
+    recent: {
+      query: async () => {
+        reads++;
+        return recent;
+      },
+    },
+    history: { query: async () => ({ messages: [], cursor: "end", done: true }) },
+    revocations: { query: async () => [] },
+  } as unknown as WeChatBridge["runtime"]["rpc"];
+  return { ...f, source, recent, reads: () => reads };
+}
+
+test("old acknowledged uncertainty stays idle and still confirms after a source change", async () => {
+  const f = await confirmationFixture("uncertain", 1, 600000);
+  await f.bridge.tick();
+  expect(f.reads()).toBe(0);
+  expect(f.store.pending("self")).toHaveLength(1);
+  f.recent.push(f.source);
+  f.bridge["applyChanges"]({
+    epoch: "epoch",
+    cursor: 1,
+    reset: false,
+    events: [
+      { type: "message.updated", account_id: "self", chat_id: "contact", message: f.source },
+    ],
+  });
+  await f.bridge.tick();
+  expect(f.reads()).toBe(1);
+  expect(f.store.get<{ state: string }>("SELECT state FROM inbox WHERE id='$pending'")?.state).toBe(
+    "delivered",
+  );
+  expect(f.store.mapping("self", "contact", f.source.id)?.event).toBe("$pending");
+  expect(f.sends).toHaveLength(0); // the late echo is neither resent nor duplicated
+});
+
+test("active confirmations and timeout notices keep their fast checks including the grace period", async () => {
+  for (const [state, notice, age] of [
+    ["submitted", 0, 1000],
+    ["sending", 0, 600000],
+    ["uncertain", 0, 600000],
+    ["uncertain", 1, 121000],
+  ] as const) {
+    const f = await confirmationFixture(state, notice, age);
+    await f.bridge.tick();
+    expect(f.reads()).toBe(1);
+    if (age === 600000) {
+      expect(f.sends).toHaveLength(1);
+      await f.bridge.tick();
+      expect(f.reads()).toBe(1);
+      expect(f.sends).toHaveLength(1);
+    }
+  }
+});

@@ -24,6 +24,13 @@ import { hash, type Inbox, type Mapping, type MatrixEvent, type Portal, Store } 
 
 const mediaKinds = new Set(["image", "sticker", "audio", "video", "file", "channels"]);
 const pendingTimeout = 120000;
+function activeSend(pending: Inbox) {
+  return (
+    pending.state !== "uncertain" ||
+    !pending.notice ||
+    Date.now() - pending.started < pendingTimeout + 5000
+  );
+}
 export class WeChatBridge {
   private busy = false;
   private stopped = false;
@@ -862,15 +869,7 @@ export class WeChatBridge {
     if (!this.portalWritable(portal))
       throw new Error("You are no longer a member of this WeChat chat");
     // At most one unresolved native send per chat makes identical-send correlation safe.
-    if (
-      this.store
-        .pending(this.account, portal.chat)
-        .some(
-          (p) =>
-            p.state !== "uncertain" || !p.notice || Date.now() - p.started < pendingTimeout + 5000,
-        )
-    )
-      return "wait";
+    if (this.store.pending(this.account, portal.chat).some(activeSend)) return "wait";
     const message = outgoing(event.content, event.type);
     let bytes: Buffer | undefined;
     let name = "",
@@ -1033,7 +1032,14 @@ export class WeChatBridge {
       const dirty = new Map(
         this.store.dirtyChats(this.account).map((row) => [row.chat, row.revision]),
       );
-      const pending = new Set(this.store.pending(this.account).map((row) => row.chat));
+      // Old acknowledged uncertainty remains eligible for source-event and
+      // periodic recovery, without forcing a complete chat read every second.
+      const pending = new Set(
+        this.store
+          .pending(this.account)
+          .filter(activeSend)
+          .map((row) => row.chat),
+      );
       const start = this.rotation++ % Math.max(portals.length, 1);
       for (let index = 0; index < portals.length; index++) {
         if (this.stopped) break;
